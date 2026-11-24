@@ -1,6 +1,8 @@
 Actor admission deployment
 
-Project commit: the COMMIT.txt next to this folder.
+Project commit: COMMIT.txt in the uploaded folder is the git revision of that folder.
+The CPU session run that reached NOT_RUN_GPU_GATE was commit 255e4c2df44eba64c4984dbc5b68fcd5aa3faa60.
+This package adds path discovery on top of that run. It does not record a GPU actor pass.
 ComfyUI revision 2fcb6cef9ab1b6dc556b7cff1765a0724ad5e884 is the historical GPU host.
 It is not required for actor admission and this bootstrap does not clone it.
 
