@@ -31,17 +31,14 @@ Stage A, CPU session, no actors
    cuda.kind on this CPU image should be cpu_build. That is a CPU result, not a failed install
    and not a passed GPU admission.
 
-Stage B, new GPU session, after check shows xfuser importable
-Repeat plan and apply first. The GPU VM does not keep the CPU session's pip packages.
-Only when check says cuda.device_count is 2:
-  H3_T4_EVIDENCE_DIR=/kaggle/working/h3-actor-admission \
-  H3_T4_ACTOR_READY_TIMEOUT_S=120 \
-  H3_T4_COLLECTIVE_TIMEOUT_S=180 \
-  H3_T4_CLEANUP_TIMEOUT_S=20 \
-  python scripts/model_retest.py --stage actor-admission --evidence-dir /kaggle/working/h3-actor-admission
-Budget for that command is 6 minutes. It uses the real H3T4Initializer and H3T4Worker.
-Download actor_admission.json, evidence.zip, and evidence.zip.sha256 before stopping.
-Do not run model-load. Weights are missing; exit 3 from model-load is not this test.
+Stage B, new GPU session
+Do not paste Python into the browser. Run All on kaggle_gpu_session.ipynb, or:
+  python scripts/run_actor_session.py --evidence-dir /kaggle/working/h3-actor-session --budget-s 240
+The script runs plan, apply, check, then actor. Check timeout is fixed at 75 seconds and is never lowered. Actor starts only if check saw two CUDA devices and at least 125 seconds remain. Actor limits are ready 45, collective 60, cleanup 20. Otherwise the status is NOT_RUN_BUDGET or NOT_RUN_GPU_GATE, and actor_admission_passed stays false.
+The command stage is capped at 240 seconds so the zip can be downloaded before shutdown. A previous GPU attempt used about 6 minutes of session time and killed check at 29 seconds, so check.json was never written and actors never started.
+No persistence: pip from the CPU session is gone. This command bootstraps again. Optional wheels/ next to the script are official xfuser, yunchang, transformers, and diffusers wheels, about 15MB, and are used with pip --find-links. They do not replace torch or ray.
+Do not run a second hand-written actor cell. The entry script starts H3T4Initializer and H3T4Worker only after the GPU gate. Download /kaggle/working/h3-actor-session/session-evidence.zip and its sha256 before stopping.
+Do not run model-load. Weights are missing; a model-load exit code is not this test.
 
 Pip must not replace torch or torchvision. Ray stays at the image version.
 No model download, no dataset publish, no public port.

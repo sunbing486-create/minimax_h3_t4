@@ -96,7 +96,7 @@ def apply_plan() -> dict[str, object]:
     if not plan["ok"]:
         plan["applied"] = False
         return plan
-    command = [sys.executable, "-m", "pip", "install", "--upgrade-strategy", "only-if-needed", *PINS]
+    command = [sys.executable, "-m", "pip", "install", "--upgrade-strategy", "only-if-needed", *_wheelhouse(), *PINS]
     completed = subprocess.run(command, check=False, text=True, capture_output=True)
     plan["applied"] = completed.returncode == 0
     plan["ok"] = completed.returncode == 0
@@ -145,6 +145,13 @@ def import_check() -> dict[str, object]:
     }
 
 
+def _wheelhouse() -> list[str]:
+    path = Path(os.environ.get("H3_T4_WHEELHOUSE", str(ROOT / "wheels")))
+    if path.is_dir() and any(path.glob("*.whl")):
+        return ["--find-links", str(path)]
+    return []
+
+
 def _pip_dry_run() -> dict[str, object]:
     report = Path(os.environ.get("H3_T4_PIP_REPORT", "/tmp/h3-admission-pip-report.json"))
     command = [
@@ -155,6 +162,7 @@ def _pip_dry_run() -> dict[str, object]:
         "--dry-run",
         "--upgrade-strategy",
         "only-if-needed",
+        *_wheelhouse(),
         "--report",
         str(report),
         *PINS,
