@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from src.minimax_h3_t4.loader_nodes import H3T4Initializer, H3T4UNETLoader, build_runtime_env_vars
+from src.minimax_h3_t4.runtime.dual_gpu_probe import _gpu_mapping
 from src.minimax_h3_t4.runtime.dual_gpu_probe import main as probe_main
 from src.minimax_h3_t4.runtime.dual_gpu_probe import run_probe
 from src.minimax_h3_t4.runtime.evidence import EvidenceStore
@@ -67,6 +68,34 @@ def test_failed_host_cannot_admit_two_14gib_reservations() -> None:
         logical_memory_already_excludes_object_store=True,
     )
     assert starved["fits"] is False
+
+
+def test_gpu_mapping_requires_two_different_device_identities() -> None:
+    same = _gpu_mapping(
+        [
+            {"rank": 0, "cuda_visible_devices": "0", "device_uuid": "GPU-A", "device_name": "Tesla T4"},
+            {"rank": 1, "cuda_visible_devices": "1", "device_uuid": "GPU-A", "device_name": "Tesla T4"},
+        ]
+    )
+    distinct = _gpu_mapping(
+        [
+            {"rank": 0, "cuda_visible_devices": "0", "device_uuid": "GPU-A", "device_name": "Tesla T4"},
+            {"rank": 1, "cuda_visible_devices": "1", "device_uuid": "GPU-B", "device_name": "Tesla T4"},
+        ]
+    )
+
+    assert same["distinct"] is False
+    assert distinct["distinct"] is True
+    assert model_stage_allowed(
+        {
+            "mode": "cuda-nccl",
+            "collective_ok": True,
+            "device_count": 2,
+            "weights_loaded": False,
+            "used_mock": False,
+            "distinct_gpu_mapping": False,
+        }
+    ) is False
 
 
 def test_rendezvous_stays_on_loopback() -> None:
@@ -220,6 +249,26 @@ def test_smoke_gate_blocks_weights_until_real_nccl_probe(monkeypatch, tmp_path: 
                 "device_count": 2,
                 "weights_loaded": False,
                 "used_mock": False,
+                "distinct_gpu_mapping": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert model_stage_allowed(json.loads(smoke.read_text(encoding="utf-8"))) is False
+    group = _group()
+    with pytest.raises(RuntimeError, match="model stage blocked"):
+        blocked.load(group, "h3.safetensors", load_after=object(), manage_parent_memory=False, force_on_failure=True)
+    assert calls == []
+
+    smoke.write_text(
+        json.dumps(
+            {
+                "mode": "cuda-nccl",
+                "collective_ok": True,
+                "device_count": 2,
+                "weights_loaded": False,
+                "used_mock": False,
+                "distinct_gpu_mapping": True,
             }
         ),
         encoding="utf-8",
@@ -354,6 +403,26 @@ def test_mock_and_cuda_probe_do_not_unlock_weights_without_two_gpus(tmp_path: Pa
 def test_probe_cli_prints_sha_and_exits_on_cuda_refusal(tmp_path: Path) -> None:
     assert probe_main(["--mode", "mock", "--evidence-dir", str(tmp_path / "mock")]) == 0
     assert probe_main(["--mode", "cuda-nccl", "--evidence-dir", str(tmp_path / "cuda")]) == 2
+    assert (
+        probe_main(
+            [
+                "--mode",
+                "builtin-cpu",
+                "--evidence-dir",
+                str(tmp_path / "hold"),
+                "--ready-timeout",
+                "0.2",
+                "--collective-timeout",
+                "0.2",
+                "--hold-seconds",
+                "30",
+            ]
+        )
+        == 2
+    )
+    held = json.loads((tmp_path / "hold" / "smoke_result.json").read_text(encoding="utf-8"))
+    assert held["collective_ok"] is False
+    assert held["distinct_gpu_mapping"] is False
     sha = (tmp_path / "cuda" / "evidence.zip.sha256").read_text(encoding="utf-8").split()[0]
     assert sha == hashlib.sha256((tmp_path / "cuda" / "evidence.zip").read_bytes()).hexdigest()
 

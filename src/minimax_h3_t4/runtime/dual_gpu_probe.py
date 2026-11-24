@@ -20,7 +20,7 @@ from typing import Any
 
 from .evidence import EvidenceStore, activate
 from .placement import FAILED_HOST_AVAILABLE_BYTES, FAILED_HOST_OBJECT_STORE_BYTES, model_stage_allowed, plan_worker_placement
-from .startup import StartupTimeout
+from .startup import StartupTimeout, choose_master_port
 
 
 def cuda_device_count() -> int:
@@ -90,6 +90,7 @@ def run_probe(
             "used_mock": resolved == "mock",
             "weights_loaded": False,
             "device_count": cuda_device_count() if resolved == "cuda-nccl" else 0,
+            "distinct_gpu_mapping": False,
             "model_stage_allowed": False,
             "video_inference_claimed": False,
             "error_type": type(exc).__name__,
@@ -109,6 +110,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-dir", default=os.environ.get("H3_T4_EVIDENCE_DIR", ""))
     parser.add_argument("--ready-timeout", type=float, default=60.0)
     parser.add_argument("--collective-timeout", type=float, default=90.0)
+    parser.add_argument(
+        "--hold-seconds",
+        type=float,
+        default=0.0,
+        help="Delay both ranks before they report ready. Use with a short --ready-timeout to force a cleanup failure.",
+    )
     args = parser.parse_args(argv)
     evidence = args.evidence_dir or None
     try:
@@ -117,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_dir=evidence,
             ready_timeout=args.ready_timeout,
             collective_timeout=args.collective_timeout,
+            hold_seconds=(args.hold_seconds, args.hold_seconds),
         )
     except Exception as exc:
         summary = {
@@ -191,6 +199,12 @@ def _run_processes(
 ) -> dict[str, Any]:
     control = _fresh_control_dir(store)
     store.event("control_dir", name=control.name)
+    if backend == "nccl":
+        port = choose_master_port(29511)
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        os.environ["H3_T4_PROBE_PORT"] = str(port)
+        store.event("probe_rendezvous", host="127.0.0.1", port=port)
     ctx = multiprocessing.get_context(start_method)
     processes = []
     for rank in (0, 1):
@@ -217,13 +231,18 @@ def _run_processes(
     expected = rank_values[0] + rank_values[1]
     if sums[0] != expected:
         raise RuntimeError(f"{backend} collective sum {sums[0]} != {expected}")
-    store.event("collective_ok", backend=backend, sum=sums[0], ready=ready)
+    mapping = _gpu_mapping(results)
+    if backend == "nccl" and not mapping["distinct"]:
+        raise RuntimeError(f"NCCL allreduce did not show two independent GPUs: {mapping}")
+    store.event("collective_ok", backend=backend, sum=sums[0], ready=ready, distinct_gpu_mapping=mapping["distinct"])
     return {
         "mode": "cuda-nccl" if backend == "nccl" else "builtin-cpu",
         "backend": backend,
         "used_mock": False,
         "collective_ok": True,
         "device_count": device_count,
+        "distinct_gpu_mapping": mapping["distinct"],
+        "gpu_mapping": mapping,
         "ready_ranks": [item["rank"] for item in ready],
         "sum": sums[0],
         "weights_loaded": False,
@@ -331,22 +350,62 @@ def _nccl_allreduce(rank: int, value: int, collective_timeout: float, control: P
     from datetime import timedelta
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ.setdefault("MASTER_PORT", os.environ.get("H3_T4_PROBE_PORT", "29511"))
-    dist.init_process_group(
-        "nccl",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=collective_timeout),
-        init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
-    )
+    os.environ["MASTER_PORT"] = str(os.environ.get("H3_T4_PROBE_PORT", "29511"))
     try:
+        dist.init_process_group(
+            "nccl",
+            rank=rank,
+            world_size=2,
+            timeout=timedelta(seconds=max(1.0, collective_timeout)),
+            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        )
         torch.cuda.set_device(0)
+        props = torch.cuda.get_device_properties(0)
+        identity = {
+            "rank": rank,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "device_name": str(getattr(props, "name", "")),
+            "device_uuid": str(getattr(props, "uuid", "") or getattr(props, "pci_bus_id", "")),
+        }
         tensor = torch.tensor([value], dtype=torch.int64, device="cuda:0")
         dist.all_reduce(tensor)
-        _atomic_json(control / f"result-{rank}.json", {"rank": rank, "ok": True, "sum": int(tensor.item()), "saw_go": True})
+        _atomic_json(
+            control / f"result-{rank}.json",
+            {"ok": True, "sum": int(tensor.item()), "saw_go": True, **identity},
+        )
+    except Exception as exc:
+        _atomic_json(
+            control / f"result-{rank}.json",
+            {
+                "rank": rank,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            },
+        )
+        raise
     finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            return
+
+
+def _gpu_mapping(results: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [
+        {
+            "rank": item.get("rank"),
+            "cuda_visible_devices": item.get("cuda_visible_devices"),
+            "device_name": item.get("device_name"),
+            "device_uuid": item.get("device_uuid"),
+        }
+        for item in results
+    ]
+    visibles = [str(row.get("cuda_visible_devices")) for row in rows]
+    uuids = [str(row.get("device_uuid") or "") for row in rows]
+    distinct = visibles == ["0", "1"] and len(uuids) == 2 and all(uuids) and len(set(uuids)) == 2
+    return {"distinct": distinct, "ranks": rows}
 
 
 def _wait_for(path: Path, timeout: float) -> bool:

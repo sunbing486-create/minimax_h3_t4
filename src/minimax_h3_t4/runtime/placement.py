@@ -173,4 +173,5 @@ def model_stage_allowed(smoke: Mapping[str, Any]) -> bool:
         and int(smoke.get("device_count") or 0) == 2
         and smoke.get("weights_loaded") is False
         and smoke.get("used_mock") is not True
+        and smoke.get("distinct_gpu_mapping") is True
     )
