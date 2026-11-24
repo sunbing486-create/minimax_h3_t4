@@ -133,6 +133,50 @@ class LazyCheckpoint(dict):
             self._resident = max(0, self._resident - _nbytes(previous))
         super().__setitem__(key, value)
 
+    def __delitem__(self, key: str) -> None:
+        previous = super().get(key)
+        if previous is not None:
+            self._resident = max(0, self._resident - _nbytes(previous))
+        super().__delitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Comfy detection uses ``dict.get``. The C implementation does not call ``__getitem__``."""
+
+        if key not in self:
+            return default
+        return self[key]
+
+    def pop(self, key: str, *default: Any) -> Any:
+        """Comfy ``load_model_weights`` pops every key. Return the tensor, then drop our reference."""
+
+        if key not in self:
+            if default:
+                return default[0]
+            raise KeyError(key)
+        value = self[key]
+        del self[key]
+        return value
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        if key not in self:
+            super().__setitem__(key, default)
+        return self[key]
+
+    def items(self):
+        for key in list(super().keys()):
+            yield key, self[key]
+
+    def values(self):
+        for key in list(super().keys()):
+            yield self[key]
+
+    def release_materialized(self) -> None:
+        """Drop tensors kept by detection reads. Keys stay so a later get can load them again."""
+
+        for key in list(super().keys()):
+            if super().get(key) is not None:
+                self[key] = None
+
     @property
     def peak_bytes(self) -> int:
         return self._peak

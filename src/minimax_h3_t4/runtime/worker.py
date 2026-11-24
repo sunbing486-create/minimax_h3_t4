@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .checkpoint import load_int8_checkpoint_mmap, normalize_state_dict_prefix, require_int8_state_dict
+from .checkpoint import normalize_state_dict_prefix, require_int8_state_dict
 from .topology import ExactH3T4Topology
-from .diag_logger import log_memory, log_fsdp_shard_state, log_host, log_tensor
+from .diag_logger import log_memory, log_fsdp_shard_state, log_host
 
 
 def validate_worker_config(config: dict[str, object]) -> None:
@@ -265,12 +265,14 @@ class H3T4Worker:
         state_dict = LazyCheckpoint(lambda key: _materialize_checkpoint_key(path, key), file_keys, prefix=prefix)
         metadata = {}
         require_int8_state_dict(state_dict)
+        state_dict.release_materialized()
         log_memory("after_checkpoint_load", extra={"num_tensors": len(state_dict), "materialized": len(state_dict.materialized_keys)})
         log_host("after_checkpoint_load")
         state_dict, metadata = comfy.utils.convert_old_quants(state_dict, "", metadata=metadata)
         config = comfy.model_detection.model_config_from_unet(state_dict, "", metadata=metadata)
         if config is None:
             raise ValueError("Checkpoint is not a native ComfyUI MiniMax-H3 model")
+        state_dict.release_materialized()
         model = config.get_model(state_dict, "")
         from comfy.model_base import MiniMaxH3
 
@@ -278,7 +280,9 @@ class H3T4Worker:
             raise TypeError(f"Expected MiniMaxH3 checkpoint, detected {type(model).__name__}")
         load_device = comfy.model_management.get_torch_device()
         offload_device = comfy.model_management.unet_offload_device()
-        model.load_model_weights(state_dict, "", assign=True)
+        # load_model_weights pops every key into one dict before load_state_dict.
+        # That would hold the whole UNet at once and would empty the lazy map
+        # before FSDP reads it. FSDP below loads one key at a time.
         gc.collect()
         torch.cuda.empty_cache()
         log_memory("after_model_init", extra={"model_params": sum(p.numel() for p in model.parameters())})
@@ -369,7 +373,7 @@ class H3T4Worker:
 
         install_int8_cuda_oom_retry(torch)
         cpu_offload = bool(self.config.get("fsdp_cpu_offload", False))
-        
+
         # Use the shared state dict directly - no disk load needed
         require_int8_state_dict(state_dict)
         prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)

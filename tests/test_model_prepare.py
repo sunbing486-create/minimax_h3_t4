@@ -25,8 +25,9 @@ def test_header_facts_use_the_measured_largest_tensors() -> None:
     assert facts["two_full_unet_payloads_fit"] is False
     assert facts["packed_unet_plus_text_fits"] is False
     assert facts["max_unet_tensor_fits"] is True
-    assert facts["lazy_pop_reads_payload"] is False
-    assert facts["one_tensor_streaming_not_what_load_unet_does"] is True
+    assert facts["lazy_pop_reads_payload"] is True
+    assert facts["load_model_weights_accumulates_every_pop"] is True
+    assert facts["model_stage_ready"] is False
     assert facts["inference_memory_proven"] is False
     assert facts["nvfp4_unpacked_resident_bytes"] is None
     assert facts["working_disk_can_hold_all_weights"] is False
@@ -44,13 +45,14 @@ def test_minimum_legal_sample_follows_the_pinned_frame_grid() -> None:
     assert align_frame_count(124) == 124
 
 
-def test_dict_pop_does_not_read_lazy_checkpoint_payloads() -> None:
+def test_pop_returns_the_tensor_and_drops_the_dict_reference() -> None:
     sizes = {"a": 10, "b": 30, "c": 5}
     lazy = LazyCheckpoint(lambda key: _Tensor(sizes[key]), list(sizes))
-    held = [lazy.pop(key) for key in list(lazy)]
-    assert held == [None, None, None]
-    assert lazy.peak_bytes == 0
-    assert lazy.materialized_keys == []
+    first = lazy.pop("b")
+    assert first.nbytes == 30
+    assert lazy.resident_bytes == 0
+    assert "b" not in lazy
+    assert lazy.peak_bytes == 30
 
 
 def test_plan_does_not_download_or_claim_admission(tmp_path: Path) -> None:

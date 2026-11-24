@@ -32,13 +32,37 @@ from minimax_h3_t4.runtime.checkpoint_budget import host_available_bytes
 from minimax_h3_t4.runtime.model_facts import COMFYUI_REVISION, memory_facts, minimum_legal_sample
 
 PROTECTED = ("torch", "torchvision", "torchaudio", "ray")
+MODEL_DEPS = (
+    "psutil",
+    "pyyaml",
+    "Pillow",
+    "scipy",
+    "tqdm",
+    "aiohttp",
+    "yarl",
+    "requests",
+    "einops",
+    "safetensors",
+    "tokenizers",
+    "sentencepiece",
+    "torchsde",
+    "alembic",
+    "SQLAlchemy",
+    "filelock",
+    "av",
+    "simpleeval",
+    "blake3",
+    "transformers==5.0.0",
+    "comfy-aimdo==0.6.0",
+    "comfy-kitchen==0.2.42",
+)
 COMFY_REMOTE = "https://github.com/Comfy-Org/ComfyUI.git"
-IMPORTS = ("comfy", "comfy.model_management", "folder_paths")
+IMPORTS = ("comfy", "folder_paths", "comfy.utils", "comfy.model_detection", "comfy.model_management", "comfy.model_base")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare the model stage without downloading weights by default")
-    parser.add_argument("--stage", choices=("plan", "clone-comfy", "audit", "download"), default="plan")
+    parser.add_argument("--stage", choices=("plan", "clone-comfy", "install-model-deps", "audit", "download"), default="plan")
     parser.add_argument("--report", default="")
     parser.add_argument("--comfy-dir", default=os.environ.get("H3_T4_COMFY_DIR", "/tmp/ComfyUI-h3"))
     parser.add_argument("--search", action="append", default=[])
@@ -51,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
         report = build_plan(search=[Path(item) for item in args.search])
     elif args.stage == "clone-comfy":
         report = clone_comfy(Path(args.comfy_dir))
+    elif args.stage == "install-model-deps":
+        report = install_model_deps()
     elif args.stage == "audit":
         report = audit_imports(Path(args.comfy_dir))
     else:
@@ -130,6 +156,58 @@ def clone_comfy(dest: Path) -> dict[str, Any]:
         "action": "fetched",
         "download": False,
         "weights_downloaded": False,
+    }
+
+
+def install_model_deps() -> dict[str, Any]:
+    """Install Comfy import dependencies. Never install or replace torch, vision, audio, or ray."""
+
+    before = {name: _versions().get(name) for name in PROTECTED}
+    if before["torch"] is None:
+        return {"ok": False, "stage": "install-model-deps", "reason": "torch is absent; this stage does not install torch", "download": False}
+    report_path = Path("/tmp/h3-model-deps-pip.json")
+    dry = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--dry-run", "--upgrade-strategy", "only-if-needed", "--report", str(report_path), *MODEL_DEPS],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    planned = []
+    if report_path.is_file():
+        planned = json.loads(report_path.read_text(encoding="utf-8")).get("install", [])
+    refused = []
+    for item in planned:
+        name = str(item.get("metadata", {}).get("name", "")).lower().replace("_", "-")
+        version = item.get("metadata", {}).get("version")
+        canonical = name.replace("-", "")
+        for protected in PROTECTED:
+            if canonical == protected.replace("-", "") and before[protected] not in {None, version}:
+                refused.append(f"{protected} {before[protected]} would become {version}")
+    if dry.returncode != 0 or refused:
+        return {
+            "ok": False,
+            "stage": "install-model-deps",
+            "reason": "; ".join(refused) or (dry.stderr or dry.stdout)[-500:],
+            "download": False,
+            "protected_versions": before,
+        }
+    installed = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade-strategy", "only-if-needed", *MODEL_DEPS],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    after = {name: _versions().get(name) for name in PROTECTED}
+    changed = {name: {"before": before[name], "after": after[name]} for name in PROTECTED if before[name] != after[name]}
+    return {
+        "ok": installed.returncode == 0 and not changed,
+        "stage": "install-model-deps",
+        "download": False,
+        "weights_downloaded": False,
+        "protected_versions": after,
+        "protected_changed": changed,
+        "pip_returncode": installed.returncode,
+        "reason": None if installed.returncode == 0 and not changed else (installed.stderr or "")[-500:],
     }
 
 
@@ -229,9 +307,8 @@ def _stop_rules() -> dict[str, Any]:
         "default_notebook_starts_gpu": False,
         "actor_pass_is_not_model_or_video_pass": True,
         "cpu_clone_stop_after_s": 600,
-        "future_gpu_download_stop": "stop a single file if it exceeds 30 minutes or free space falls below the next file",
-        "future_gpu_load_stop": "stop if load exceeds 20 minutes or available memory falls below 2GiB",
-        "future_gpu_sample": "only after load evidence exists: 32x32, 5 frames, 1 step, then ffprobe; do not continue to 736x416x124 in the same unattended session",
+        "future_gpu_session": "not started by this notebook; a later command must exit by itself and record evidence before anyone can leave it running",
+        "future_gpu_sample": "only after a measured load says the full tensors were released: 32x32, 5 frames, 1 step, then ffprobe",
         "old_weight_free_budget_is_not_enough": "the 240s command and 6 minute GPU budget covered actor admission only",
     }
 
