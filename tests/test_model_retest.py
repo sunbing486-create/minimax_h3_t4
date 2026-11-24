@@ -66,6 +66,30 @@ def test_actor_admission_uses_initializer_and_does_not_load_weights(monkeypatch,
     assert saved["model_stage_allowed"] is False
 
 
+def test_cleanup_failure_keeps_the_collective_claim(tmp_path: Path) -> None:
+    class Group:
+        alive = True
+
+        def close(self, timeout_seconds: float = 20, force: bool = False) -> None:
+            raise RuntimeError("ray shutdown exceeded")
+
+    class Initializer:
+        last_join = [_join(0, "GPU-A", "0"), _join(1, "GPU-B", "1")]
+        last_placement = None
+        evidence = None
+
+        def initialize(self, *args: object, **kwargs: object) -> tuple[Group]:
+            return (Group(),)
+
+    with pytest.raises(RuntimeError, match="ray shutdown exceeded"):
+        run_actor_admission(evidence_dir=tmp_path, initializer=Initializer())
+    saved = json.loads((tmp_path / "actor_admission.json").read_text(encoding="utf-8"))
+    assert saved["collective_ok"] is True
+    assert saved["distinct_gpu_mapping"] is True
+    assert saved["cleanup"]["ok"] is False
+    assert saved["weights_loaded"] is False
+
+
 def test_subprocess_probe_file_does_not_satisfy_actor_admission(tmp_path: Path) -> None:
     probe = tmp_path / "smoke_result.json"
     probe.write_text(json.dumps({"mode": "cuda-nccl", "collective_ok": True, "distinct_gpu_mapping": True, "weights_loaded": False}), encoding="utf-8")

@@ -29,4 +29,7 @@ def test_notebook_cells_compile() -> None:
         ast.parse(source)
         compile(source, "<notebook>", "exec")
         assert "except:" not in source
+        assert "raise SystemExit(code)" not in source
+        assert "raise SystemExit(subprocess.call" not in source
         assert "timeout" not in source or "29" not in source
+        assert "show_session_evidence" in source

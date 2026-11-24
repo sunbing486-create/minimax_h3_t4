@@ -74,22 +74,42 @@ def run_actor_admission(*, evidence_dir: Path, initializer: Any | None = None) -
         report["collective_ok"] = False
         report["error_type"] = type(exc).__name__
         report["message"] = str(exc)
-        _write(evidence_dir / "actor_admission.json", report)
-        _mirror_evidence(initializer, evidence_dir)
+        _finish_admission(evidence_dir, initializer, group, report)
         raise
     else:
-        _write(evidence_dir / "actor_admission.json", report)
-        _mirror_evidence(initializer, evidence_dir)
+        _finish_admission(evidence_dir, initializer, group, report)
+        if report.get("cleanup", {}).get("ok") is not True:
+            message = str(report.get("cleanup", {}).get("message") or "actor cleanup failed")
+            raise RuntimeError(message)
         if not report["collective_ok"]:
             raise RuntimeError("Ray actor admission did not prove two independent GPUs and an allreduce sum of 5")
         return report
-    finally:
-        if group is not None and getattr(group, "alive", False):
+
+
+def _finish_admission(evidence_dir: Path, initializer: Any, group: Any, report: dict[str, Any]) -> None:
+    """Record the join result before cleanup, then record cleanup without erasing it."""
+
+    report["cleanup"] = {"ok": None, "status": "PENDING"}
+    _write(evidence_dir / "actor_admission.json", report)
+    if group is not None and getattr(group, "alive", False):
+        try:
             group.close(timeout_seconds=float(os.environ.get("H3_T4_CLEANUP_TIMEOUT_S", "20")), force=True)
+        except BaseException as exc:
+            report["cleanup"] = {"ok": False, "status": "FAILED", "error_type": type(exc).__name__, "message": str(exc)[:500]}
+        else:
+            report["cleanup"] = {"ok": True, "status": "CLOSED"}
+    else:
+        report["cleanup"] = {"ok": True, "status": "NO_GROUP"}
+    _write(evidence_dir / "actor_admission.json", report)
+    _mirror_evidence(initializer, evidence_dir)
 
 
 def _write(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _mirror_evidence(initializer: Any, evidence_dir: Path) -> None:
