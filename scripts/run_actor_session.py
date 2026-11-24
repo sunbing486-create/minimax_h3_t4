@@ -157,15 +157,21 @@ def run_session(
     finally:
         state["elapsed_s"] = round(time.time() - started, 3)
         state["actor_admission_passed"] = state.get("actor_admission_passed") is True
+        state["snapshot"] = "pre-seal"
+        state["bundle_status"] = "NOT_SEALED"
+        state["bundle_note"] = "pre-seal snapshot stored inside the evidence zip; the sibling manifest is the final record"
         _persist(evidence, state)
         _event(evidence, "session_finish", status=state.get("status"), elapsed_s=state["elapsed_s"])
         try:
             state["bundle"] = seal_evidence(evidence)
             state["bundle_status"] = "SEALED"
+            state.pop("bundle_error", None)
         except Exception as exc:
             state["bundle_status"] = "FAILED"
             state["bundle_error"] = {"error_type": type(exc).__name__, "message": str(exc)[:500]}
+        state["snapshot"] = "final"
         _persist(evidence, state)
+        _write(bundle_paths(evidence)["manifest"], state)
 
 
 def classify_actor_outcome(*, returncode: int | None, timed_out: bool, admission: dict[str, Any] | None) -> dict[str, Any]:
@@ -217,9 +223,15 @@ def show_session_evidence(evidence: Path) -> dict[str, Any]:
     status_path = evidence / "session-status.json"
     actor_path = evidence / "actor-result.json"
     bundle = bundle_paths(evidence)
-    files = [status_path, actor_path, bundle["zip"], bundle["sidecar"]]
+    files = [bundle["manifest"], status_path, actor_path, bundle["zip"], bundle["sidecar"]]
     listing = []
+    if bundle["manifest"].is_file():
+        print("FINAL_MANIFEST", flush=True)
+        print(bundle["manifest"].read_text(encoding="utf-8"), end="", flush=True)
+    else:
+        print("MISSING " + bundle["manifest"].name, flush=True)
     if status_path.is_file():
+        print("SESSION_STATUS", flush=True)
         print(status_path.read_text(encoding="utf-8"), end="", flush=True)
     else:
         print("MISSING session-status.json", flush=True)
@@ -252,19 +264,23 @@ def bundle_paths(evidence: Path) -> dict[str, Path]:
 
     evidence = Path(evidence)
     zip_path = evidence.parent / f"{evidence.name}-evidence.zip"
-    return {"zip": zip_path, "sidecar": Path(str(zip_path) + ".sha256")}
+    return {
+        "zip": zip_path,
+        "sidecar": Path(str(zip_path) + ".sha256"),
+        "manifest": evidence.parent / f"{evidence.name}-manifest.json",
+    }
 
 
 def seal_evidence(evidence: Path) -> dict[str, Any]:
     paths = bundle_paths(evidence)
     zip_path = paths["zip"]
     sidecar = paths["sidecar"]
-    excluded = {zip_path.resolve(), sidecar.resolve()}
+    excluded = {zip_path.resolve(), sidecar.resolve(), paths["manifest"].resolve()}
     selected = []
     for path in sorted(evidence.rglob("*")):
         if not path.is_file():
             continue
-        if path.resolve() in excluded or path.name in {zip_path.name, sidecar.name}:
+        if path.resolve() in excluded or path.name in {zip_path.name, sidecar.name, paths["manifest"].name}:
             continue
         selected.append(path)
     partial = zip_path.with_name(zip_path.name + ".partial")

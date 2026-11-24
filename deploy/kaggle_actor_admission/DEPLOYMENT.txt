@@ -28,8 +28,12 @@ that variable is set. They are not created beside src.
 
 Evidence from one command is /kaggle/working/h3-actor-session/session-status.json
 and actor-result.json. The downloadable bundle is the sibling
-/kaggle/working/h3-actor-session-evidence.zip plus its .sha256 file. The notebook
-prints those names, sizes, and the hash, and shows FileLinks. actor_admission_passed
+/kaggle/working/h3-actor-session-evidence.zip plus its .sha256 file. The final
+record is the sibling h3-actor-session-manifest.json. The copy of
+session-status.json inside the zip is the pre-seal snapshot and says
+NOT_SEALED; that is not a failed bundle when the manifest says SEALED and the
+sidecar matches the zip. The notebook prints those names, sizes, and the hash,
+and shows FileLinks. actor_admission_passed
 is true only when the admission file records the collective, distinct GPUs, no
 weights, cleanup closed, and the actor process exits 0. A file claim with a
 non-zero exit remains visible as ACTOR_FAILED_AFTER_CLAIM and is not a pass.

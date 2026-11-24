@@ -42,11 +42,20 @@ def _assert_bundle(evidence: Path, status: dict[str, object]) -> None:
     digest = hashlib.sha256(paths["zip"].read_bytes()).hexdigest()
     assert digest in paths["sidecar"].read_text(encoding="utf-8")
     assert status["bundle"]["sha256"] == digest
+    assert status["snapshot"] == "final"
     assert status["bundle_status"] == "SEALED"
-    names = zipfile.ZipFile(paths["zip"]).namelist()
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    assert manifest["snapshot"] == "final"
+    assert manifest["bundle_status"] == "SEALED"
+    assert manifest["bundle"]["sha256"] == digest
+    with zipfile.ZipFile(paths["zip"]) as archive:
+        names = archive.namelist()
+        packed = json.loads(archive.read("session-status.json"))
     assert paths["zip"].name not in names
     assert paths["sidecar"].name not in names
-    assert "session-status.json" in names
+    assert paths["manifest"].name not in names
+    assert packed["snapshot"] == "pre-seal"
+    assert packed["bundle_status"] == "NOT_SEALED"
     assert "actor-result.json" in names
 
 

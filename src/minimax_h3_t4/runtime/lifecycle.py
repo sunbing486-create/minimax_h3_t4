@@ -8,6 +8,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .topology import ExactH3T4Topology
@@ -100,35 +101,107 @@ def _force_kill(ray_module: Any, workers: list[Any], deadline: float) -> None:
         raise errors[0]
 
 
-def _confirm_dead(ray_module: Any, workers: list[Any], deadline: float) -> int:
+def process_liveness(pid: int | None) -> str:
+    """Return gone, zombie, alive, or unknown from the OS process table.
+
+    ``os.kill(pid, 0)`` is not enough: a zombie still accepts that signal.
+    A missing ``/proc`` entry means the process has been reaped. State ``Z``
+    means it has exited and is no longer running.
+    """
+
+    if not isinstance(pid, int) or pid <= 0:
+        return "unknown"
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        text = stat_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "gone"
+    except OSError:
+        return "unknown"
+    try:
+        state = text.rsplit(")", 1)[1].split()[0]
+    except (IndexError, ValueError):
+        return "unknown"
+    if state == "Z":
+        return "zombie"
+    return "alive"
+
+
+def _probe_actor_death(ray_module: Any, worker: Any, timeout: float) -> str:
+    """One bounded Ray observation. ``dead`` is an actor error, not a successful reply."""
+
     actor_error = _actor_error_type(ray_module)
-    refs: list[Any] = []
-    confirmed = 0
-    for worker in workers:
-        try:
-            refs.append(remote(worker, "__ray_ready__"))
-        except actor_error:
-            confirmed += 1
-        except BaseException:
-            continue
-    if refs:
-        try:
-            ready, pending = ray_module.wait(
-                refs,
-                num_returns=len(refs),
-                timeout=max(0.0, deadline - time.monotonic()),
-            )
-        except BaseException:
-            return len(workers) - confirmed
-        confirmed += len(pending) * 0
-        for ref in ready:
-            try:
-                ray_module.get(ref)
-            except actor_error:
-                confirmed += 1
-            except BaseException:
-                pass
-    return max(0, len(workers) - confirmed)
+    try:
+        ref = remote(worker, "__ray_ready__")
+    except actor_error:
+        return "dead"
+    except BaseException:
+        return "unseen"
+    try:
+        ready, _pending = ray_module.wait([ref], num_returns=1, timeout=max(0.0, timeout))
+    except BaseException:
+        return "unseen"
+    if not ready:
+        return "unseen"
+    try:
+        ray_module.get(ready[0])
+    except actor_error:
+        return "dead"
+    except BaseException:
+        return "unseen"
+    return "alive"
+
+
+def confirm_actor_exit(ray_module: Any, workers: list[Any], pids: dict[int, int], deadline: float) -> list[dict[str, Any]]:
+    """Poll until the deadline. A live PID is not dead, even if one Ray call already returned.
+
+    The GPU failure came from a single ``__ray_ready__`` sample after ``ray.kill``.
+    Kill is asynchronous, so that sample can see one actor still answer. This
+    keeps looking at ``/proc`` until the cleanup budget ends. A missing or
+    zombie PID confirms exit. An unknown PID can be confirmed only by a Ray
+    actor error. A running PID is never turned into success.
+    """
+
+    records: list[dict[str, Any]] = []
+    for index, _worker in enumerate(workers):
+        pid = pids.get(index)
+        records.append(
+            {
+                "index": index,
+                "pid": pid if isinstance(pid, int) else None,
+                "confirmed": False,
+                "basis": "unseen",
+                "proc_state": "unknown",
+            }
+        )
+    pending = set(range(len(workers)))
+    while pending and time.monotonic() < deadline:
+        finished: list[int] = []
+        for index in list(pending):
+            record = records[index]
+            proc_state = process_liveness(record["pid"])
+            record["proc_state"] = proc_state
+            if proc_state in {"gone", "zombie"}:
+                record["confirmed"] = True
+                record["basis"] = f"pid_{proc_state}"
+                finished.append(index)
+                continue
+            if proc_state == "alive":
+                record["basis"] = "pid_alive"
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            probe = _probe_actor_death(ray_module, workers[index], min(0.2, remaining))
+            record["basis"] = "ray_actor_error" if probe == "dead" else probe
+            if probe == "dead":
+                record["confirmed"] = True
+                finished.append(index)
+        for index in finished:
+            pending.discard(index)
+        if pending and time.monotonic() < deadline:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return records
 
 
 @dataclass
@@ -138,6 +211,17 @@ class H3T4ActorGroup:
     topology: ExactH3T4Topology = field(default_factory=ExactH3T4Topology)
     checkpoint: str | None = None
     alive: bool = True
+    worker_pids: dict[int, int] = field(default_factory=dict)
+    termination: list[dict[str, Any]] = field(default_factory=list)
+
+    def note_ready(self, results: list[Any] | None) -> None:
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            rank = item.get("rank")
+            pid = item.get("pid")
+            if isinstance(rank, int) and not isinstance(rank, bool) and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                self.worker_pids[rank] = pid
 
     def require_alive(self) -> None:
         if not self.alive:
@@ -190,9 +274,13 @@ class H3T4ActorGroup:
                 except BaseException as exc:
                     graceful_failure = graceful_failure or exc
 
-        unconfirmed = _confirm_dead(self.ray_module, self.workers, deadline)
+        self.termination = confirm_actor_exit(self.ray_module, self.workers, self.worker_pids, deadline)
+        unconfirmed = [row for row in self.termination if row["confirmed"] is not True]
         if unconfirmed:
-            raise RuntimeError(f"Worker termination could not be confirmed for {unconfirmed} actor(s)") from graceful_failure
+            detail = ", ".join(
+                f"index={row['index']} pid={row['pid']} basis={row['basis']} proc_state={row['proc_state']}" for row in unconfirmed
+            )
+            raise RuntimeError(f"Worker termination could not be confirmed for {len(unconfirmed)} actor(s): {detail}") from graceful_failure
 
         self.alive = False
         remaining = max(0.0, deadline - time.monotonic())

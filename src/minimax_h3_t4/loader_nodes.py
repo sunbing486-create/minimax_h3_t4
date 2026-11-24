@@ -337,13 +337,18 @@ class H3T4Initializer:
                 pass
             force = force_on_failure or isinstance(exc, (StartupTimeout, PlacementError))
             try:
-                H3T4ActorGroup(workers, ray_module, topology).close(timeout_seconds=env_seconds("H3_T4_CLEANUP_TIMEOUT_S", 5), force=force)
+                self._actor_group(workers, ray_module, topology).close(timeout_seconds=env_seconds("H3_T4_CLEANUP_TIMEOUT_S", 5), force=force)
             except BaseException as close_exc:
                 add_note = getattr(exc, "add_note", None)
                 if callable(add_note):
                     add_note(f"Secondary worker teardown failure: {type(close_exc).__name__}: {close_exc}")
             raise
-        return (H3T4ActorGroup(workers, ray_module, topology),)
+        return (self._actor_group(workers, ray_module, topology),)
+
+    def _actor_group(self, workers: list[Any], ray_module: Any, topology: ExactH3T4Topology) -> H3T4ActorGroup:
+        group = H3T4ActorGroup(workers, ray_module, topology)
+        group.note_ready(self.last_ready)
+        return group
 
     def _admit_workers(self, ray_module: Any, world_size: int, object_store_bytes: int, evidence: EvidenceStore) -> int:
         reader = getattr(ray_module, "available_resources", None)
