@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from minimax_h3_t4.runtime.actor_admission import run_actor_admission
+from minimax_h3_t4.runtime.model_stage import run_gated_model_stage
 from minimax_h3_t4.model_catalog import (
     OFFICIAL_TOTAL_BYTES,
     disk_report,
@@ -114,40 +115,14 @@ def _admission(evidence: Path, preflight: dict) -> dict:
 
 
 def _model_gate(evidence: Path, preflight: dict) -> dict:
-    """Do not load weights unless this process repeats actor admission and files match."""
-
-    preflight["stage"] = "model-load"
+    stage = run_gated_model_stage(
+        inventory=preflight["inventory"],
+        allow_model_load=os.environ.get("H3_T4_ALLOW_MODEL_LOAD") == "1",
+        cuda_count=_cuda_count(),
+    )
+    preflight.update(stage)
     preflight["inference_allowed"] = False
     preflight["video_inference_claimed"] = False
-    if os.environ.get("H3_T4_ALLOW_MODEL_LOAD") != "1":
-        preflight["status"] = "NOT_RUN"
-        preflight["reason"] = "H3_T4_ALLOW_MODEL_LOAD is not 1"
-        return preflight
-    if preflight["inventory"]["status"] != "REUSABLE":
-        preflight["status"] = "MISSING"
-        preflight["reason"] = "official files are not all present with matching sha256"
-        return preflight
-    if _cuda_count() != 2:
-        preflight["status"] = "NOT_RUN"
-        preflight["reason"] = "model load was not started because two CUDA devices are not visible"
-        return preflight
-    try:
-        admission = run_actor_admission(evidence_dir=evidence)
-    except Exception as exc:
-        preflight["status"] = "FAILED"
-        preflight["error_type"] = type(exc).__name__
-        preflight["message"] = str(exc)
-        return preflight
-    preflight["actor_admission"] = admission
-    if not admission.get("collective_ok"):
-        preflight["status"] = "FAILED"
-        preflight["reason"] = "actor admission failed before load"
-        return preflight
-    preflight["status"] = "NOT_RUN"
-    preflight["reason"] = (
-        "actor admission passed and files match, but this command does not launch T2V/I2V. "
-        "Memory headroom is not proven. Start ComfyUI only in a separate explicit step."
-    )
     return preflight
 
 
@@ -194,6 +169,10 @@ def _emit(report: dict, evidence: Path, report_path: str) -> int:
     if report.get("stage") == "actor-admission" and report.get("status") not in {"ADMITTED", "NOT_RUN"}:
         return 2
     if report.get("stage") == "actor-admission" and report.get("status") == "NOT_RUN":
+        return 2
+    if report.get("stage") == "model-load" and report.get("status") == "BLOCKED_MISSING":
+        return 3
+    if report.get("stage") == "model-load" and report.get("status") != "CALLED":
         return 2
     return 0
 

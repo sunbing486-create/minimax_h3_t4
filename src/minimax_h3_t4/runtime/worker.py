@@ -97,6 +97,13 @@ def _patch_psutil() -> None:
     psutil.virtual_memory = virtual_memory
 
 
+def _materialize_checkpoint_key(path: str, key: str) -> Any:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        return handle.get_tensor(key)
+
+
 class H3T4Worker:
     """One rank of the fixed two-T4 FSDP + Ulysses MiniMax-H3 runtime."""
 
@@ -233,14 +240,33 @@ class H3T4Worker:
         # RAM peak on constrained Kaggle hosts.
         import comfy.utils as _cu
         _cu.MMAP_TORCH_FILES = True
-        log_memory("load_unet_start", extra={"cpu_offload": cpu_offload})
+        from .checkpoint_budget import LazyCheckpoint, host_available_bytes, read_safetensors_header, sequential_resident_plan
+
+        header = read_safetensors_header(path)
+        load_plan = sequential_resident_plan(
+            file_bytes=int(header["total_bytes"]),
+            max_tensor_bytes=int(header["max_tensor_bytes"]),
+            host_available_bytes=host_available_bytes(),
+        )
+        log_memory("load_unet_start", extra={"cpu_offload": cpu_offload, "load_plan": load_plan})
         log_host("load_unet_start")
-        state_dict, metadata = load_int8_checkpoint_mmap(path)
+        if not load_plan["streaming_second_rank_fits"]:
+            raise MemoryError(
+                "refusing to materialize the UNet: streaming shard peak "
+                f"{load_plan['streaming_second_rank_peak_bytes']} bytes does not fit "
+                f"{load_plan['host_available_bytes']} available bytes. "
+                f"Old full-file peak would be {load_plan['old_second_rank_peak_bytes']} bytes "
+                f"(fits={load_plan['old_second_rank_fits']})."
+            )
+        file_keys = [item["key"] for item in header["tensors"]]
+        prefix = "diffusion_model." if any(key.startswith("diffusion_model.") for key in file_keys) else ""
+        if not prefix and any(key.startswith("model.") for key in file_keys):
+            prefix = "model."
+        state_dict = LazyCheckpoint(lambda key: _materialize_checkpoint_key(path, key), file_keys, prefix=prefix)
+        metadata = {}
         require_int8_state_dict(state_dict)
-        log_memory("after_checkpoint_load", extra={"num_tensors": len(state_dict)})
+        log_memory("after_checkpoint_load", extra={"num_tensors": len(state_dict), "materialized": len(state_dict.materialized_keys)})
         log_host("after_checkpoint_load")
-        prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)
-        state_dict = normalize_state_dict_prefix(state_dict, prefix)
         state_dict, metadata = comfy.utils.convert_old_quants(state_dict, "", metadata=metadata)
         config = comfy.model_detection.model_config_from_unet(state_dict, "", metadata=metadata)
         if config is None:
@@ -253,9 +279,6 @@ class H3T4Worker:
         load_device = comfy.model_management.get_torch_device()
         offload_device = comfy.model_management.unet_offload_device()
         model.load_model_weights(state_dict, "", assign=True)
-        # Drop the checkpoint now that the model owns its weights.
-        # This avoids a second ~12GB allocation when we build `full_state`.
-        del state_dict
         gc.collect()
         torch.cuda.empty_cache()
         log_memory("after_model_init", extra={"model_params": sum(p.numel() for p in model.parameters())})
@@ -265,11 +288,8 @@ class H3T4Worker:
 
         patcher_class = h3_fsdp_patcher_class(comfy.model_patcher.ModelPatcher)
         patcher = patcher_class(model, load_device, offload_device, size=local_model_size, cpu_offload=cpu_offload)
-        full_state = normalize_state_dict_prefix(
-            patcher.model_state_dict(filter_prefix="diffusion_model."),
-            "diffusion_model.",
-        )
-        log_memory("before_fsdp_shard", extra={"full_state_keys": len(full_state)})
+        full_state = state_dict
+        log_memory("before_fsdp_shard", extra={"full_state_keys": len(full_state), "materialized": len(state_dict.materialized_keys)})
         log_host("before_fsdp_shard")
         diffusion = model.diffusion_model
         diffusion.to("meta")

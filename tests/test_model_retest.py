@@ -147,7 +147,18 @@ def test_actor_admission_cli_does_not_run_without_two_gpus(tmp_path: Path) -> No
 def test_model_load_stays_off_by_default(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("H3_T4_ALLOW_MODEL_LOAD", raising=False)
     code = retest_main(["--stage", "model-load", "--search", str(tmp_path), "--evidence-dir", str(tmp_path / "out")])
-    assert code == 0
+    assert code == 2
     report = json.loads((tmp_path / "out" / "preflight.json").read_text(encoding="utf-8"))
-    assert report["status"] == "NOT_RUN"
-    assert "H3_T4_ALLOW_MODEL_LOAD" in report["reason"]
+    assert report["status"] == "BLOCKED_GATE"
+    assert report["called_sampler"] is False
+
+
+def test_model_load_stops_at_missing_files_before_the_sampler(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("H3_T4_ALLOW_MODEL_LOAD", "1")
+    code = retest_main(["--stage", "model-load", "--search", str(tmp_path), "--evidence-dir", str(tmp_path / "out")])
+    assert code == 3
+    report = json.loads((tmp_path / "out" / "preflight.json").read_text(encoding="utf-8"))
+    assert report["status"] == "BLOCKED_MISSING"
+    assert report["next_call"] == "H3T4Sampler.sample"
+    assert report["called_loader"] is False
+    assert report["video_inference_claimed"] is False

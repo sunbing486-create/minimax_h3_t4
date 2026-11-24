@@ -6,6 +6,6 @@ Do not spend time in the stop UI before that download. The previous stop interac
 
 Actor admission is off unless H3_T4_STAGE=actor-admission. Budget 6 minutes: ready up to 120 seconds, collective up to 180 seconds, cleanup 20 seconds. Then download actor_admission.json, evidence.zip, and evidence.zip.sha256 before stopping.
 
-Do not enable model-load in this pass. The unet file is larger than one T4, and two full copies are larger than host RAM. FSDP offload may still work later, but that peak was not measured.
+Do not enable model-load until actor-admission has been downloaded. With the current MISSING inventory it exits 3 at BLOCKED_MISSING and does not download. If the four hashed files are later mounted, model-load calls H3T4Sampler.sample. Budget that attempt at 15 minutes and keep the existing load timeout of 900 seconds. The old full-file plus second-copy peak does not fit the previous 31475970048 available bytes; streaming keeps one tensor at a time plus the retained shard. That streaming peak is not a measured GPU result.
 
 Do not recreate the weight set on /kaggle/working. It is smaller than 42470585471 bytes. Do not publish a new dataset from this notebook.

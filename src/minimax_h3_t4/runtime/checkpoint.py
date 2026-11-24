@@ -84,7 +84,8 @@ def normalize_state_dict_prefix(state_dict: dict[str, Any], prefix: str) -> dict
 
 def require_int8_state_dict(state_dict: dict[str, Any]) -> None:
     """Fail closed unless every quantized payload is ComfyKitchen tensorwise INT8."""
-    configs = [_decode(value) for key, value in state_dict.items() if key.endswith(".comfy_quant")]
+    quant_keys = [key for key in state_dict if str(key).endswith(".comfy_quant")]
+    configs = [_decode(state_dict[key]) for key in quant_keys]
     if not configs or any(config is None or config.get("format") != "int8_tensorwise" for config in configs):
         raise ValueError("The standalone MiniMax-H3 runtime is INT8-only (int8_tensorwise required)")
     if any(config.get("convrot") is not True for config in configs if config is not None):
