@@ -296,6 +296,28 @@ def test_builtin_cpu_probe_is_not_a_dual_t4_result(tmp_path: Path) -> None:
     assert multiprocessing.active_children() == []
 
 
+def test_probe_rerun_does_not_reuse_previous_control_files(tmp_path: Path) -> None:
+    first = run_probe(mode="builtin-cpu", evidence_dir=tmp_path, ready_timeout=5, collective_timeout=5)
+    assert first["collective_ok"] is True
+
+    with pytest.raises(StartupTimeout, match="rank readiness exceeded"):
+        run_probe(
+            mode="builtin-cpu",
+            evidence_dir=tmp_path,
+            ready_timeout=0.15,
+            collective_timeout=0.15,
+            hold_seconds=(30.0, 30.0),
+        )
+
+    smoke = json.loads((tmp_path / "smoke_result.json").read_text(encoding="utf-8"))
+    assert smoke["collective_ok"] is False
+    assert smoke["model_stage_allowed"] is False
+    controls = list((tmp_path / "probe" / "controls").iterdir())
+    assert len(controls) == 2
+    assert all(path.is_dir() for path in controls)
+    assert multiprocessing.active_children() == []
+
+
 def test_probe_timeout_stops_and_keeps_a_verifiable_bundle(tmp_path: Path) -> None:
     with pytest.raises(StartupTimeout, match="rank readiness exceeded"):
         run_probe(

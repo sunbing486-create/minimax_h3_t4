@@ -14,6 +14,7 @@ import json
 import multiprocessing
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -188,8 +189,8 @@ def _run_processes(
     hold_seconds: tuple[float, float],
     device_count: int,
 ) -> dict[str, Any]:
-    control = store.run_dir / "control"
-    control.mkdir(parents=True, exist_ok=True)
+    control = _fresh_control_dir(store)
+    store.event("control_dir", name=control.name)
     ctx = multiprocessing.get_context(start_method)
     processes = []
     for rank in (0, 1):
@@ -234,8 +235,21 @@ def _run_processes(
     }
 
 
+def _fresh_control_dir(store: EvidenceStore) -> Path:
+    """One empty directory per probe attempt.
+
+    Reusing ``probe/control`` lets a later short run observe the previous
+    attempt's ready and result files and report a collective that never ran.
+    """
+
+    control = store.run_dir / "controls" / uuid.uuid4().hex
+    control.mkdir(parents=True, exist_ok=False)
+    return control
+
+
 def _wait_ready(control: Path, timeout: float, processes: list[Any], store: EvidenceStore) -> list[dict[str, Any]]:
     deadline = time.monotonic() + timeout
+    expected_pids = {int(proc.pid) for proc in processes if proc.pid is not None}
     found: dict[int, dict[str, Any]] = {}
     while len(found) < 2:
         if time.monotonic() > deadline:
@@ -243,9 +257,13 @@ def _wait_ready(control: Path, timeout: float, processes: list[Any], store: Evid
             raise StartupTimeout(f"rank readiness exceeded {timeout:.3f}s; missing={sorted(set((0, 1)) - set(found))}; live_pids={live}")
         for rank in (0, 1):
             path = control / f"ready-{rank}.json"
-            if rank not in found and path.is_file():
-                found[rank] = json.loads(path.read_text(encoding="utf-8"))
-                store.event("rank_ready", rank=rank, pid=found[rank].get("pid"))
+            if rank in found or not path.is_file():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if int(payload.get("pid", -1)) not in expected_pids:
+                continue
+            found[rank] = payload
+            store.event("rank_ready", rank=rank, pid=payload.get("pid"))
         if len(found) < 2:
             time.sleep(0.02)
     return [found[0], found[1]]
