@@ -22,6 +22,9 @@ below actually returns.
 Persistence: Kaggle "No persistence" drops /tmp and /kaggle/working when the session
 stops. Upload this directory as a Kaggle dataset input and run from that input path
 on both the CPU session and the later GPU session. Do not treat /tmp as the code source.
+The input mount is read-only. Ray working_dir, session logs, and the zipped
+py_modules are written under /tmp/h3-ray-runtime, or under H3_T4_RUNTIME_DIR when
+that variable is set. They are not created beside src.
 
 Stage A, CPU session, no actors
 1. Open the dataset that contains this folder. Do not start a GPU.

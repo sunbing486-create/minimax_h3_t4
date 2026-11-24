@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,46 @@ def build_runtime_env_vars(*, pythonpath: str, comfy_root: str, evidence_dir: st
     return env
 
 
+def source_tree_root() -> Path:
+    """Uploaded package root. Kaggle mounts this tree read-only."""
+
+    return Path(__file__).resolve().parents[2]
+
+
+def ray_runtime_paths() -> dict[str, Path]:
+    """Writable Ray working directory and session temp.
+
+    ``working_dir`` has to exist before Ray packages it. The session temp is
+    where Ray writes the zipped ``py_modules`` and ``working_dir``, plus logs.
+    Both used to be created beside this file, under ``src/_ray_runtime_env``.
+    """
+
+    explicit = os.environ.get("H3_T4_RUNTIME_DIR", "").strip()
+    root = Path(explicit) if explicit else Path(tempfile.gettempdir()) / "h3-ray-runtime"
+    root = root.resolve()
+    source_root = source_tree_root().resolve()
+    try:
+        root.relative_to(source_root)
+    except ValueError:
+        inside_source = False
+    else:
+        inside_source = True
+    if inside_source:
+        raise RuntimeError(f"Ray runtime directory must not be inside the source tree: {root}")
+    temp_dir = root / "temp"
+    working_dir = root / "working_dir"
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        working_dir.mkdir(parents=True, exist_ok=True)
+        for directory in (temp_dir, working_dir):
+            probe = directory / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+    except OSError as exc:
+        raise RuntimeError(f"Ray runtime directory is not writable: {root}") from exc
+    return {"root": root, "temp_dir": temp_dir, "working_dir": working_dir}
+
+
 def build_admission_runtime_env() -> dict[str, object]:
     """Ray env for weight-free actor admission.
 
@@ -53,8 +94,7 @@ def build_admission_runtime_env() -> dict[str, object]:
     """
 
     package_dir = Path(__file__).resolve().parent
-    runtime_workdir = package_dir.parent / "_ray_runtime_env"
-    runtime_workdir.mkdir(parents=True, exist_ok=True)
+    runtime_workdir = ray_runtime_paths()["working_dir"]
     python_entries = []
     existing = os.environ.get("PYTHONPATH")
     if existing:
@@ -84,8 +124,7 @@ def _build_runtime_env() -> dict[str, object]:
     )
     if comfy_root is None:
         raise RuntimeError("Unable to locate the ComfyUI repository root for Ray workers")
-    runtime_workdir = package_dir.parent / "_ray_runtime_env"
-    runtime_workdir.mkdir(parents=True, exist_ok=True)
+    runtime_workdir = ray_runtime_paths()["working_dir"]
     python_entries = [str(comfy_root)]
     existing = os.environ.get("PYTHONPATH")
     if existing:
@@ -248,12 +287,16 @@ class H3T4Initializer:
         workers: list[Any] = []
         object_store_bytes = int(float(ray_object_store_gb) * 1024**3)
         try:
+            paths = ray_runtime_paths()
+            evidence.event("ray_runtime_dir", temp_dir=str(paths["temp_dir"]), working_dir=str(paths["working_dir"]))
+            runtime_env = (build_admission_runtime_env if for_admission and self._runtime_env_builder is _build_runtime_env else self._runtime_env_builder)()
             ray_module.init(
                 address="local",
                 namespace=ray_cluster_namespace,
                 object_store_memory=object_store_bytes,
                 include_dashboard=False,
-                runtime_env=(build_admission_runtime_env if for_admission and self._runtime_env_builder is _build_runtime_env else self._runtime_env_builder)(),
+                _temp_dir=str(paths["temp_dir"]),
+                runtime_env=runtime_env,
             )
             memory_bytes = self._admit_workers(ray_module, topology.world_size, object_store_bytes, evidence)
             master_port = choose_master_port()
