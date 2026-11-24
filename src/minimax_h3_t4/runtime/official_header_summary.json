@@ -1,0 +1,234 @@
+{
+  "minimax_h3_audio_vae_fp32.safetensors": {
+    "tensor_count": 917,
+    "declared_payload_bytes": 605149280,
+    "dtype_counts": {
+      "F32": 917
+    },
+    "largest": [
+      {
+        "bytes": 83886080,
+        "key": "encoder.block.5.block.4.weight",
+        "shape": [
+          2048,
+          1024,
+          10
+        ],
+        "dtype": "F32"
+      },
+      {
+        "bytes": 58720256,
+        "key": "decoder.conv_pre.weight",
+        "shape": [
+          1024,
+          2048,
+          7
+        ],
+        "dtype": "F32"
+      },
+      {
+        "bytes": 50331648,
+        "key": "encoder.block.7.weight",
+        "shape": [
+          2048,
+          2048,
+          3
+        ],
+        "dtype": "F32"
+      },
+      {
+        "bytes": 50331648,
+        "key": "pre_block.attn.qkv.weight",
+        "shape": [
+          6144,
+          2048
+        ],
+        "dtype": "F32"
+      },
+      {
+        "bytes": 29360128,
+        "key": "encoder.block.5.block.0.block.1.weight",
+        "shape": [
+          1024,
+          1024,
+          7
+        ],
+        "dtype": "F32"
+      }
+    ],
+    "header_bytes": 105520
+  },
+  "minimax_h3_fl2va_pruned_int8_convrot.safetensors": {
+    "tensor_count": 932,
+    "declared_payload_bytes": 20970284192,
+    "dtype_counts": {
+      "F32": 210,
+      "BF16": 220,
+      "F16": 102,
+      "I8": 200,
+      "U8": 200
+    },
+    "largest": [
+      {
+        "bytes": 308281344,
+        "key": "token_refiner.blocks.0.mlp.fc1.weight",
+        "shape": [
+          28672,
+          5376
+        ],
+        "dtype": "BF16"
+      },
+      {
+        "bytes": 308281344,
+        "key": "token_refiner.blocks.1.mlp.fc1.weight",
+        "shape": [
+          28672,
+          5376
+        ],
+        "dtype": "BF16"
+      },
+      {
+        "bytes": 231211008,
+        "key": "token_refiner.blocks.0.attn.qkv_proj.weight",
+        "shape": [
+          21504,
+          5376
+        ],
+        "dtype": "BF16"
+      },
+      {
+        "bytes": 231211008,
+        "key": "token_refiner.blocks.1.attn.qkv_proj.weight",
+        "shape": [
+          21504,
+          5376
+        ],
+        "dtype": "BF16"
+      },
+      {
+        "bytes": 154140672,
+        "key": "token_refiner.blocks.0.mlp.fc2.weight",
+        "shape": [
+          5376,
+          14336
+        ],
+        "dtype": "BF16"
+      }
+    ],
+    "header_bytes": 95416
+  },
+  "minimax_h3_video_vae_fp16.safetensors": {
+    "tensor_count": 562,
+    "declared_payload_bytes": 5207742160,
+    "dtype_counts": {
+      "F16": 562
+    },
+    "largest": [
+      {
+        "bytes": 67108864,
+        "key": "decoder.transformer_blocks.0.ff.w1.weight",
+        "shape": [
+          16384,
+          2048
+        ],
+        "dtype": "F16"
+      },
+      {
+        "bytes": 67108864,
+        "key": "decoder.transformer_blocks.1.ff.w1.weight",
+        "shape": [
+          16384,
+          2048
+        ],
+        "dtype": "F16"
+      },
+      {
+        "bytes": 67108864,
+        "key": "decoder.transformer_blocks.10.ff.w1.weight",
+        "shape": [
+          16384,
+          2048
+        ],
+        "dtype": "F16"
+      },
+      {
+        "bytes": 67108864,
+        "key": "decoder.transformer_blocks.11.ff.w1.weight",
+        "shape": [
+          16384,
+          2048
+        ],
+        "dtype": "F16"
+      },
+      {
+        "bytes": 67108864,
+        "key": "decoder.transformer_blocks.12.ff.w1.weight",
+        "shape": [
+          16384,
+          2048
+        ],
+        "dtype": "F16"
+      }
+    ],
+    "header_bytes": 66328
+  },
+  "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors": {
+    "tensor_count": 2054,
+    "declared_payload_bytes": 15686911143,
+    "dtype_counts": {
+      "F32": 351,
+      "BF16": 651,
+      "F8_E4M3": 350,
+      "I8": 1,
+      "U8": 701
+    },
+    "largest": [
+      {
+        "bytes": 777912320,
+        "key": "model.embed_tokens.weight",
+        "shape": [
+          151936,
+          5120
+        ],
+        "dtype": "I8"
+      },
+      {
+        "bytes": 65536000,
+        "key": "model.layers.0.mlp.down_proj.weight",
+        "shape": [
+          5120,
+          12800
+        ],
+        "dtype": "U8"
+      },
+      {
+        "bytes": 65536000,
+        "key": "model.layers.0.mlp.gate_proj.weight",
+        "shape": [
+          25600,
+          2560
+        ],
+        "dtype": "U8"
+      },
+      {
+        "bytes": 65536000,
+        "key": "model.layers.0.mlp.up_proj.weight",
+        "shape": [
+          25600,
+          2560
+        ],
+        "dtype": "U8"
+      },
+      {
+        "bytes": 65536000,
+        "key": "model.layers.1.mlp.down_proj.weight",
+        "shape": [
+          5120,
+          12800
+        ],
+        "dtype": "U8"
+      }
+    ],
+    "header_bytes": 231400
+  }
+}
