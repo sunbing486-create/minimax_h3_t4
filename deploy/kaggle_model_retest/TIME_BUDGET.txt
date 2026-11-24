@@ -1,0 +1,11 @@
+Next Kaggle session
+
+Default notebook stage is preflight. Do not pip install and do not replace the CUDA torch.
+Run All once. If files are absent, expect a few minutes, then download one small preflight.json.
+Do not spend time in the stop UI before that download. The previous stop interaction ran to 11 minutes against an 8 minute plan.
+
+Actor admission is off unless H3_T4_STAGE=actor-admission. Budget 6 minutes: ready up to 120 seconds, collective up to 180 seconds, cleanup 20 seconds. Then download actor_admission.json, evidence.zip, and evidence.zip.sha256 before stopping.
+
+Do not enable model-load in this pass. The unet file is larger than one T4, and two full copies are larger than host RAM. FSDP offload may still work later, but that peak was not measured.
+
+Do not recreate the weight set on /kaggle/working. It is smaller than 42470585471 bytes. Do not publish a new dataset from this notebook.

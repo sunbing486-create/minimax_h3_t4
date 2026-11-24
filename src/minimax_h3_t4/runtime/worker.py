@@ -131,8 +131,31 @@ class H3T4Worker:
         if not self.distributed_ready:
             self._initialize_distributed()
             self.distributed_ready = True
+        report = self._prove_nccl_without_weights()
         self._rank_log("join_end")
-        return {"rank": self.rank, "status": "joined", "pid": os.getpid()}
+        return report
+
+    def _prove_nccl_without_weights(self) -> dict[str, object]:
+        """One scalar allreduce after the process group exists. No checkpoint is read."""
+
+        import torch
+        import torch.distributed as dist
+
+        if self.model is not None:
+            raise RuntimeError("actor admission must finish before any weight is loaded")
+        tensor = torch.tensor([self.rank + 2], dtype=torch.int64, device=self.device)
+        dist.all_reduce(tensor)
+        props = torch.cuda.get_device_properties(self.device)
+        return {
+            "rank": self.rank,
+            "status": "joined",
+            "pid": os.getpid(),
+            "sum": int(tensor.item()),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "device_name": str(getattr(props, "name", "")),
+            "device_uuid": str(getattr(props, "uuid", "") or getattr(props, "pci_bus_id", "")),
+            "weights_loaded": False,
+        }
 
     def _rank_log(self, message: str) -> None:
         line = f"{datetime.now(timezone.utc).isoformat(timespec='milliseconds')} rank={self.rank} {message}\n"

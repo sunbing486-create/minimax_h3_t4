@@ -88,6 +88,10 @@ def current_evidence() -> EvidenceStore | None:
 
 
 def _require_smoke_before_weights() -> None:
+    if os.environ.get("H3_T4_REQUIRE_ACTOR_ADMISSION", "0") == "1":
+        from .runtime.actor_admission import require_actor_admission_file
+
+        require_actor_admission_file(os.environ.get("H3_T4_ACTOR_ADMISSION_FILE", ""))
     if os.environ.get("H3_T4_REQUIRE_SMOKE", "0") != "1":
         return
     raw = os.environ.get("H3_T4_SMOKE_FILE", "")
@@ -147,6 +151,8 @@ class H3T4Initializer:
         self._worker_factory = worker_factory
         self._runtime_env_builder = runtime_env_builder or _build_runtime_env
         self.last_placement: dict[str, Any] | None = None
+        self.last_ready: list[Any] = []
+        self.last_join: list[Any] = []
         self.evidence: EvidenceStore | None = None
 
     def _create_worker(
@@ -238,9 +244,9 @@ class H3T4Initializer:
                 interrupt_checker()
             ready_timeout = env_seconds("H3_T4_ACTOR_READY_TIMEOUT_S", 120)
             join_timeout = env_seconds("H3_T4_COLLECTIVE_TIMEOUT_S", 180)
-            run_stage(workers, ray_module, "ready", ready_timeout, evidence, interrupt_checker=interrupt_checker)
+            self.last_ready = run_stage(workers, ray_module, "ready", ready_timeout, evidence, interrupt_checker=interrupt_checker)
             evidence.snapshot_processes()
-            run_stage(
+            self.last_join = run_stage(
                 workers,
                 ray_module,
                 "join_process_group",
