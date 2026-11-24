@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import gc
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from .checkpoint import load_int8_checkpoint_mmap, normalize_state_dict_prefix, require_int8_state_dict
@@ -106,7 +107,45 @@ class H3T4Worker:
         self.model = None
         self.device_mesh = None
         self.spectrum_controller = None
-        self._initialize_distributed()
+        self.distributed_ready = False
+        self._rank_log("actor_init")
+
+    def ready(self) -> dict[str, object]:
+        """Return once this process exists, before any collective.
+
+        The parent waits for every rank to reach this point and only then
+        calls ``join_process_group``. Doing the rendezvous inside ``__init__``
+        lets rank 0 block before rank 1 has a process.
+        """
+
+        self._rank_log("ready")
+        return {
+            "rank": self.rank,
+            "pid": os.getpid(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "distributed_ready": self.distributed_ready,
+        }
+
+    def join_process_group(self) -> dict[str, object]:
+        self._rank_log("join_begin")
+        if not self.distributed_ready:
+            self._initialize_distributed()
+            self.distributed_ready = True
+        self._rank_log("join_end")
+        return {"rank": self.rank, "status": "joined", "pid": os.getpid()}
+
+    def _rank_log(self, message: str) -> None:
+        line = f"{datetime.now(timezone.utc).isoformat(timespec='milliseconds')} rank={self.rank} {message}\n"
+        print(line, end="", flush=True)
+        root = os.environ.get("H3_T4_EVIDENCE_DIR")
+        if not root:
+            return
+        path = Path(root) / "ranks" / f"rank{self.rank}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _initialize_distributed(self) -> None:
         import torch
@@ -114,6 +153,7 @@ class H3T4Worker:
         from xfuser.core.distributed import init_distributed_environment, initialize_model_parallel
 
         from .int8 import require_tesla_t4
+        from .placement import assert_single_visible_gpu
 
         # Kaggle reports 32GB but only has ~30GB usable. Patch psutil so
         # ComfyUI computes conservative memory budgets and stops trying to
@@ -122,14 +162,20 @@ class H3T4Worker:
 
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
+        assert_single_visible_gpu(int(torch.cuda.device_count()), os.environ.get("CUDA_VISIBLE_DEVICES"), self.rank)
         require_tesla_t4(torch, self.device)
         if not dist.is_initialized():
+            from .startup import rendezvous_endpoint
+
+            master_addr, master_port = rendezvous_endpoint(self.config)
+            os.environ["MASTER_ADDR"] = master_addr
+            os.environ["MASTER_PORT"] = master_port
             dist.init_process_group(
                 "nccl",
                 rank=self.rank,
                 world_size=2,
                 timeout=timedelta(minutes=2),
-                init_method=(f"tcp://{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{os.environ.get('MASTER_PORT', '29500')}"),
+                init_method=f"tcp://{master_addr}:{master_port}",
             )
         self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(2,))
         init_distributed_environment(rank=self.rank, world_size=2, local_rank=0, backend="nccl")
@@ -143,6 +189,8 @@ class H3T4Worker:
         )
 
     def load_unet(self, path: str, weight_dtype: str) -> bool:
+        if not self.distributed_ready:
+            raise RuntimeError("join_process_group must succeed before loading weights")
         if weight_dtype != "int8":
             raise ValueError("MiniMax-H3 two-T4 worker is INT8-only")
         import comfy.model_detection
@@ -237,6 +285,16 @@ class H3T4Worker:
         return True
 
     def load_unet_from_state_dict(self, state_dict_ref: Any, weight_dtype: str) -> bool:
+        """Load model from an already-loaded state dict (broadcast from main process).
+
+        This avoids the double-RAM peak when multiple workers each load the full checkpoint.
+        Each worker resolves its own reference from the shared state dict via Ray Object Store.
+        """
+        if not self.distributed_ready:
+            raise RuntimeError("join_process_group must succeed before loading weights")
+        return self._load_unet_from_state_dict(state_dict_ref, weight_dtype)
+
+    def _load_unet_from_state_dict(self, state_dict_ref: Any, weight_dtype: str) -> bool:
         """Load model from an already-loaded state dict (broadcast from main process).
 
         This avoids the double-RAM peak when multiple workers each load the full checkpoint.

@@ -9,9 +9,10 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 
 _DIAG_ENABLED = os.environ.get("H3_T4_DIAG", "1") == "1"
@@ -34,6 +35,8 @@ def log_memory(tag: str, extra: dict[str, Any] | None = None) -> None:
     """Log CUDA memory state at the current point."""
     if not _DIAG_ENABLED:
         return
+    import torch
+
     dev = torch.cuda.current_device()
     allocated = torch.cuda.memory_allocated(dev)
     reserved = torch.cuda.memory_reserved(dev)
