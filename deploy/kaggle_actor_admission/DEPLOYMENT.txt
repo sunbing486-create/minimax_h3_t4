@@ -1,0 +1,47 @@
+Actor admission deployment
+
+Project commit: the COMMIT.txt next to this folder.
+ComfyUI revision 2fcb6cef9ab1b6dc556b7cff1765a0724ad5e884 is the historical GPU host.
+It is not required for actor admission and this bootstrap does not clone it.
+
+H3T4Worker.join_process_group imports torch and xfuser.core.distributed, then calls
+init_distributed_environment and initialize_model_parallel. On a GPU that call also
+imports yunchang. comfy and folder_paths are imported only by load_unet, so a missing
+ComfyUI checkout does not block actor admission. Missing weight files do not block it.
+Missing xfuser or yunchang does.
+
+On a CPU torch build, importing xfuser.core.distributed raises
+NotImplementedError: No Accelerators available. That is xfuser's own accelerator
+check, not a missing module. The CPU check may still set
+materials_ready_for_gpu_stage true. gpu_stage_permitted stays false until
+cuda.device_count is 2. actor_admission_passed stays false until the GPU command
+below actually returns.
+
+Persistence: Kaggle "No persistence" drops /tmp and /kaggle/working when the session
+stops. Upload this directory as a Kaggle dataset input and run from that input path
+on both the CPU session and the later GPU session. Do not treat /tmp as the code source.
+
+Stage A, CPU session, no actors
+1. Open the dataset that contains this folder. Do not start a GPU.
+2. python scripts/bootstrap_actor_admission.py --stage plan --report /kaggle/working/bootstrap-plan.json
+   If ok is false because torch would change, stop. Do not apply.
+3. python scripts/bootstrap_actor_admission.py --stage apply --report /kaggle/working/bootstrap-apply.json
+4. python scripts/bootstrap_actor_admission.py --stage check --report /kaggle/working/bootstrap-check.json
+   Download those three JSON files before stopping. actor_admission_passed must stay false.
+   cuda.kind on this CPU image should be cpu_build. That is a CPU result, not a failed install
+   and not a passed GPU admission.
+
+Stage B, new GPU session, after check shows xfuser importable
+Repeat plan and apply first. The GPU VM does not keep the CPU session's pip packages.
+Only when check says cuda.device_count is 2:
+  H3_T4_EVIDENCE_DIR=/kaggle/working/h3-actor-admission \
+  H3_T4_ACTOR_READY_TIMEOUT_S=120 \
+  H3_T4_COLLECTIVE_TIMEOUT_S=180 \
+  H3_T4_CLEANUP_TIMEOUT_S=20 \
+  python scripts/model_retest.py --stage actor-admission --evidence-dir /kaggle/working/h3-actor-admission
+Budget for that command is 6 minutes. It uses the real H3T4Initializer and H3T4Worker.
+Download actor_admission.json, evidence.zip, and evidence.zip.sha256 before stopping.
+Do not run model-load. Weights are missing; exit 3 from model-load is not this test.
+
+Pip must not replace torch or torchvision. Ray stays at the image version.
+No model download, no dataset publish, no public port.

@@ -44,6 +44,35 @@ def build_runtime_env_vars(*, pythonpath: str, comfy_root: str, evidence_dir: st
     return env
 
 
+def build_admission_runtime_env() -> dict[str, object]:
+    """Ray env for weight-free actor admission.
+
+    ``H3T4Worker.join_process_group`` imports torch and
+    ``xfuser.core.distributed``. It does not import ``comfy`` or
+    ``folder_paths``. Those are only needed later, when ``load_unet`` runs.
+    """
+
+    package_dir = Path(__file__).resolve().parent
+    runtime_workdir = package_dir.parent / "_ray_runtime_env"
+    runtime_workdir.mkdir(parents=True, exist_ok=True)
+    python_entries = []
+    existing = os.environ.get("PYTHONPATH")
+    if existing:
+        python_entries.extend(part for part in existing.split(os.pathsep) if part)
+    env = {
+        "PYTHONPATH": os.pathsep.join(dict.fromkeys(python_entries)),
+        "MASTER_ADDR": "127.0.0.1",
+    }
+    evidence_dir = os.environ.get("H3_T4_EVIDENCE_DIR")
+    if evidence_dir:
+        env["H3_T4_EVIDENCE_DIR"] = evidence_dir
+    return {
+        "py_modules": [str(package_dir)],
+        "working_dir": str(runtime_workdir),
+        "env_vars": env,
+    }
+
+
 def _build_runtime_env() -> dict[str, object]:
     import folder_paths
 
@@ -196,6 +225,7 @@ class H3T4Initializer:
         manage_parent_memory: bool = True,
         interrupt_checker: Any | None = None,
         force_on_failure: bool = False,
+        for_admission: bool = False,
     ) -> tuple[H3T4ActorGroup]:
         if not 4.0 <= float(ray_object_store_gb) <= 16.0:
             raise ValueError("ray_object_store_gb must be between 4.0 and 16.0 GiB")
@@ -223,7 +253,7 @@ class H3T4Initializer:
                 namespace=ray_cluster_namespace,
                 object_store_memory=object_store_bytes,
                 include_dashboard=False,
-                runtime_env=self._runtime_env_builder(),
+                runtime_env=(build_admission_runtime_env if for_admission and self._runtime_env_builder is _build_runtime_env else self._runtime_env_builder)(),
             )
             memory_bytes = self._admit_workers(ray_module, topology.world_size, object_store_bytes, evidence)
             master_port = choose_master_port()

@@ -61,7 +61,12 @@ def run_actor_admission(*, evidence_dir: Path, initializer: Any | None = None) -
     group = None
     report: dict[str, Any]
     try:
-        group = initializer.initialize(load_after=object(), manage_parent_memory=False, force_on_failure=True)[0]
+        group = initializer.initialize(
+            load_after=object(),
+            manage_parent_memory=False,
+            force_on_failure=True,
+            for_admission=True,
+        )[0]
         report = summarize_actor_join(list(getattr(initializer, "last_join", []) or []))
         report["placement"] = getattr(initializer, "last_placement", None)
     except BaseException as exc:
