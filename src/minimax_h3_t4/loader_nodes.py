@@ -175,6 +175,7 @@ def probe_worker_imports(
     checkpoint_dir: Path,
     checkpoint_file: str | None = None,
     module_names: tuple[str, ...] = LOAD_WORKER_IMPORTS,
+    load_entry: bool = False,
 ) -> dict[str, Any]:
     """Import the load stack inside a Ray worker, not in the driver.
 
@@ -200,8 +201,8 @@ def probe_worker_imports(
         )
         remote = ray.remote(worker_import_snapshot)
         snapshot = ray.get(
-            remote.remote(list(module_names), str(checkpoint_dir), checkpoint_file),
-            timeout=90,
+            remote.remote(list(module_names), str(checkpoint_dir), checkpoint_file, load_entry),
+            timeout=120,
         )
     except Exception as exc:
         return {

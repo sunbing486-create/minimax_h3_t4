@@ -26,7 +26,7 @@ for entry in (ROOT, SRC):
 from minimax_h3_t4.model_catalog import inventory_local_models
 from minimax_h3_t4.runtime.checkpoint_budget import host_available_bytes
 from minimax_h3_t4.loader_nodes import build_unet_runtime_env, probe_worker_imports
-from minimax_h3_t4.runtime.unet_load import UNET_SPEC, choose_weight_dir, required_files, run_unet_load_only, runtime_gate, worker_probe_blockers
+from minimax_h3_t4.runtime.unet_load import UNET_SPEC, choose_weight_dir, persist_process_sample, required_files, run_unet_load_only, runtime_gate, worker_probe_blockers
 from scripts.bootstrap_actor_admission import apply_plan, import_check
 from scripts.prepare_model_stage import audit_imports, clone_comfy, install_model_deps
 from scripts.run_actor_session import seal_evidence, show_session_evidence
@@ -127,6 +127,7 @@ def _kill_group(pid: int) -> None:
 def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy_dir: Path) -> int:
     evidence.mkdir(parents=True, exist_ok=True)
     os.environ["H3_T4_EVIDENCE_DIR"] = str(evidence)
+    persist_process_sample(str(evidence), "stage0")
     deadline = time.monotonic() + budget_s
     state: dict[str, object] = {
         "stage": "unet-load-session",
@@ -167,6 +168,7 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
             state["worker_probe"] = probe_worker_imports(
                 runtime_env=build_unet_runtime_env(comfy_dir),
                 checkpoint_dir=probe_dir,
+                load_entry=True,
             )
         except Exception as exc:
             state["worker_probe"] = {"ok": False, "error_type": type(exc).__name__, "message": str(exc)[:500], "imports": [], "cuda_count": None, "checkpoint_dir_writable": False}

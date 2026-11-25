@@ -13,7 +13,6 @@ from comfy.ldm.minimax.model import (
     patchify_video,
     rope_rotation_table,
     time_shift_sigma,
-    time_shift_slope,
     unpack_audio,
     unpatchify_video,
     PackedLayout,
@@ -22,17 +21,15 @@ from comfy.ldm.minimax.model import (
 )
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
+from .schedule import time_shift_slope
+
 from .attention import make_ulysses_attention
 from .memory_trace import memory_snapshot as _mem_snapshot, memory_trace_enabled as _trace_enabled
 from .utils import pad_to_world_size
 from .diag_logger import (
     log_memory,
-    log_tensor,
     log_attention_memory,
     log_ulysses_alltoall,
-    profile_start,
-    profile_end,
-    log_fsdp_shard_state,
 )
 
 

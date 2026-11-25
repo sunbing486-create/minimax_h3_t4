@@ -125,6 +125,25 @@ def bounded_weight_check(module: Any, path: str | None, *, limit: int = 64) -> d
     return {"status": "CHECKED" if compared else "NOT_COMPARABLE", "compared": compared, "matched": matched}
 
 
+def persist_process_sample(evidence_dir: str | None, label: str, *, rank: int | None = None) -> dict[str, Any]:
+    """Append one sample and fsync it before the next import can fail."""
+
+    import json
+
+    sample = sample_process_memory(label)
+    sample["rank"] = rank
+    sample["sampled_max_is_not_a_continuous_profiler_peak"] = True
+    sample["weight_alignment"] = "unknown"
+    if evidence_dir:
+        path = Path(evidence_dir) / "memory-samples.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sample, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return sample
+
+
 def sample_process_memory(label: str) -> dict[str, Any]:
     rss = pss = available = cached = None
     status = Path("/proc/self/status")
@@ -222,6 +241,12 @@ def worker_probe_blockers(probe: dict[str, Any], *, require_cuda: int = 2) -> li
     for name, wanted in expected.items():
         if wanted and versions.get(name) != wanted:
             blockers.append(f"ray worker {name} {versions.get(name)} != driver {wanted}")
+    entry = probe.get("load_entry")
+    if isinstance(entry, dict):
+        for name in entry.get("missing") or []:
+            blockers.append(f"load entry missing {name}")
+        if require_cuda == 2 and entry.get("ok") is not True:
+            blockers.append("load entry import did not succeed inside the ray worker")
     return blockers
 
 
@@ -251,6 +276,7 @@ def run_unet_load_only(
             decision["action"] = "STOP_BUDGET_BEFORE_LOAD"
             decision["reason"] = "the remaining session time is inside the cleanup reserve"
             return decision
+    persist_process_sample(os.environ.get("H3_T4_EVIDENCE_DIR"), "before_worker_load")
     if evidence is not None:
         evidence.event("unet_load_only_start", path=unet_path, timeout_seconds=load_timeout)
     from ..loader_nodes import H3T4Initializer, H3T4UNETLoader, build_unet_runtime_env
@@ -294,19 +320,28 @@ def run_unet_load_only(
             evidence.event("unet_load_only_failed", error_type=type(exc).__name__)
         return decision
     finally:
-        cleanup: dict[str, Any] = {"attempted": group is not None and getattr(group, "alive", False)}
-        if group is not None and getattr(group, "alive", False):
+        termination = getattr(group, "termination", None) if group is not None else None
+        alive = group is not None and getattr(group, "alive", False)
+        cleanup: dict[str, Any] = {"attempted": bool(alive or termination), "alive_before_outer_close": alive}
+        if alive:
             try:
                 group.close(timeout_seconds=float(os.environ.get("H3_T4_CLEANUP_TIMEOUT_S", "20")), force=True)
                 cleanup["ok"] = True
                 cleanup["termination"] = getattr(group, "termination", None)
+                cleanup["closed_by"] = "load_entry"
             except Exception as exc:
                 cleanup["ok"] = False
                 cleanup["error_type"] = type(exc).__name__
                 cleanup["message"] = str(exc)[:500]
                 cleanup["termination"] = getattr(group, "termination", None)
+        elif termination:
+            unconfirmed = [row for row in termination if isinstance(row, dict) and row.get("confirmed") is not True]
+            cleanup["ok"] = not unconfirmed
+            cleanup["termination"] = termination
+            cleanup["closed_by"] = "loader"
         else:
-            cleanup["ok"] = True
+            cleanup["ok"] = False
+            cleanup["reason"] = "worker termination was not recorded"
         decision["cleanup"] = cleanup
 
 

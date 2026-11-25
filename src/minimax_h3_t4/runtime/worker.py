@@ -97,7 +97,7 @@ def _patch_psutil() -> None:
     psutil.virtual_memory = virtual_memory
 
 
-def worker_import_snapshot(module_names: list[str], checkpoint_dir: str, checkpoint_file: str | None = None) -> dict[str, Any]:
+def worker_import_snapshot(module_names: list[str], checkpoint_dir: str, checkpoint_file: str | None = None, load_entry: bool = False) -> dict[str, Any]:
     """Run inside a Ray worker. Report imports from that process only."""
 
     import importlib
@@ -157,7 +157,7 @@ def worker_import_snapshot(module_names: list[str], checkpoint_dir: str, checkpo
         except OSError as exc:
             readable = False
             write_error = f"{type(exc).__name__}: {exc}"
-    return {
+    report = {
         "pid": os.getpid(),
         "cwd": os.getcwd(),
         "pythonpath": os.environ.get("PYTHONPATH"),
@@ -172,6 +172,11 @@ def worker_import_snapshot(module_names: list[str], checkpoint_dir: str, checkpo
         "path_error": write_error,
         "weight_alignment": "unknown",
     }
+    if load_entry:
+        from .load_entry import import_unet_load_entry
+
+        report["load_entry"] = import_unet_load_entry()
+    return report
 
 
 def _materialize_checkpoint_key(path: str, key: str) -> Any:
@@ -204,6 +209,7 @@ class H3T4Worker:
         lets rank 0 block before rank 1 has a process.
         """
 
+        self._persist_sample("ready")
         self._rank_log("ready")
         return {
             "rank": self.rank,
@@ -242,6 +248,11 @@ class H3T4Worker:
             "device_uuid": str(getattr(props, "uuid", "") or getattr(props, "pci_bus_id", "")),
             "weights_loaded": False,
         }
+
+    def _persist_sample(self, label: str) -> None:
+        from .unet_load import persist_process_sample
+
+        self.load_trace.append(persist_process_sample(os.environ.get("H3_T4_EVIDENCE_DIR"), label, rank=self.rank))
 
     def _rank_log(self, message: str) -> None:
         line = f"{datetime.now(timezone.utc).isoformat(timespec='milliseconds')} rank={self.rank} {message}\n"
@@ -299,15 +310,13 @@ class H3T4Worker:
 
     def load_unet(self, path: str, weight_dtype: str) -> bool:
         self._last_load_error = None
-        from .unet_load import sample_process_memory
-
-        self.load_trace.append(sample_process_memory("load_unet_enter"))
+        self._persist_sample("load_unet_enter")
         self._rank_log(f"load_unet_enter pid={os.getpid()} cvd={os.environ.get('CUDA_VISIBLE_DEVICES')}")
         try:
             return self._load_unet_impl(path, weight_dtype)
         except BaseException as exc:
             self._last_load_error = {"error_type": type(exc).__name__, "message": str(exc)[:500]}
-            self.load_trace.append(sample_process_memory("load_unet_failed"))
+            self._persist_sample("load_unet_failed")
             self._rank_log(f"load_unet_failed {type(exc).__name__}: {exc}")
             raise
 
