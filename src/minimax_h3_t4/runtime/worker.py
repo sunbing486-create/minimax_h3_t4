@@ -115,6 +115,8 @@ class H3T4Worker:
         self.device_mesh = None
         self.spectrum_controller = None
         self.distributed_ready = False
+        self._unet_path: str | None = None
+        self.load_trace: list[dict[str, Any]] = []
         self._rank_log("actor_init")
 
     def ready(self) -> dict[str, object]:
@@ -241,7 +243,11 @@ class H3T4Worker:
         import comfy.utils as _cu
         _cu.MMAP_TORCH_FILES = True
         from .checkpoint_budget import LazyCheckpoint, host_available_bytes, read_safetensors_header, sequential_resident_plan
+        from .unet_load import sample_process_memory
 
+        self.load_trace.append(sample_process_memory("before_construct"))
+        if host_available_bytes() < 2 * 1024**3:
+            raise MemoryError("available memory fell below 2GiB before UNet construction")
         header = read_safetensors_header(path)
         load_plan = sequential_resident_plan(
             file_bytes=int(header["total_bytes"]),
@@ -278,6 +284,7 @@ class H3T4Worker:
         # reserve the full parameter storage. meta keeps the shapes and skips
         # the physical allocation; FSDP materializes each shard afterwards.
         model = config.get_model(state_dict, "", torch.device("meta"))
+        self.load_trace.append(sample_process_memory("after_meta_construct"))
         from comfy.model_base import MiniMaxH3
 
         if not isinstance(model, MiniMaxH3):
@@ -298,6 +305,7 @@ class H3T4Worker:
         patcher = patcher_class(model, load_device, offload_device, size=local_model_size, cpu_offload=cpu_offload)
         full_state = state_dict
         log_memory("before_fsdp_shard", extra={"full_state_keys": len(full_state), "materialized": len(state_dict.materialized_keys)})
+        self.load_trace.append(sample_process_memory("before_shard"))
         log_host("before_fsdp_shard")
         diffusion = model.diffusion_model
         diffusion.to("meta")
@@ -333,7 +341,22 @@ class H3T4Worker:
         log_memory("load_unet_complete")
         log_host("load_unet_complete")
         self.model = patcher
+        self._unet_path = path
+        self.load_trace.append(sample_process_memory("load_complete"))
         return True
+
+    def shard_report(self) -> dict[str, Any]:
+        from .unet_load import bounded_weight_check, sample_process_memory, summarize_module_storage
+
+        storage = summarize_module_storage(self.model)
+        return {
+            "storage": storage,
+            "weight_check": bounded_weight_check(self.model, getattr(self, "_unet_path", None)),
+            "process": sample_process_memory("shard_report"),
+            "trace": list(getattr(self, "load_trace", [])),
+            "loaded": storage["materialized_bytes"] > 0 and storage["meta_bytes"] < storage["logical_bytes"],
+            "video_inference_claimed": False,
+        }
 
     def load_unet_from_state_dict(self, state_dict_ref: Any, weight_dtype: str) -> bool:
         """Load model from an already-loaded state dict (broadcast from main process).

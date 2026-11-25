@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -67,8 +68,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--comfy-dir", default=os.environ.get("H3_T4_COMFY_DIR", "/tmp/ComfyUI-h3"))
     parser.add_argument("--search", action="append", default=[])
     parser.add_argument("--confirm-download", action="store_true")
+    parser.add_argument("--enable-transfer", action="store_true")
     parser.add_argument("--only", default="")
     parser.add_argument("--dest-dir", default="")
+    parser.add_argument("--budget-s", type=float, default=600)
     args = parser.parse_args(argv)
     report_path = Path(args.report) if args.report else Path.cwd() / f"model-{args.stage}.json"
     if args.stage == "plan":
@@ -80,9 +83,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.stage == "audit":
         report = audit_imports(Path(args.comfy_dir))
     else:
-        report = refuse_or_plan_download(confirm=args.confirm_download, only=args.only, dest_dir=args.dest_dir)
+        report = download_official(
+            confirm=args.confirm_download,
+            enable_transfer=args.enable_transfer,
+            only=args.only,
+            dest_dir=args.dest_dir,
+            deadline=time.monotonic() + args.budget_s,
+        )
     _write(report_path, report)
-    print(json.dumps({"stage": args.stage, "report": str(report_path), "ok": report.get("ok"), "download": False, "actor_admission_passed": False, "video_inference_claimed": False}, sort_keys=True))
+    print(json.dumps({"stage": args.stage, "report": str(report_path), "ok": report.get("ok"), "download": report.get("started_transfer") is True, "actor_admission_passed": False, "video_inference_claimed": False}, sort_keys=True))
     return 0 if report.get("ok") else 2
 
 
@@ -244,8 +253,8 @@ def audit_imports(comfy_dir: Path) -> dict[str, Any]:
     }
 
 
-def refuse_or_plan_download(*, confirm: bool, only: str, dest_dir: str) -> dict[str, Any]:
-    """Never start a transfer from this function. Confirmation only records a checked plan."""
+def download_official(*, confirm: bool, enable_transfer: bool, only: str, dest_dir: str, deadline: float) -> dict[str, Any]:
+    """Check space first. Transfer bytes only when enable_transfer is set."""
 
     if not confirm or not only or not dest_dir:
         return {
@@ -274,15 +283,27 @@ def refuse_or_plan_download(*, confirm: bool, only: str, dest_dir: str) -> dict[
         }
     if str(dest).startswith("/kaggle/working") and int(chosen["bytes"]) > int(disk.get("free") or 0):
         return {"ok": False, "stage": "download", "download": False, "started_transfer": False, "reason": "working disk cannot hold this file"}
-    return {
-        "ok": True,
-        "stage": "download",
-        "download": False,
-        "started_transfer": False,
-        "reason": "capacity check passed; this command does not transfer bytes",
-        "file": chosen,
-        "dest": str(dest),
-    }
+    if not enable_transfer:
+        return {
+            "ok": True,
+            "stage": "download",
+            "download": False,
+            "started_transfer": False,
+            "reason": "capacity check passed; transfer is implemented but not enabled",
+            "file": chosen,
+            "dest": str(dest),
+        }
+    from minimax_h3_t4.runtime.official_transfer import transfer_file
+
+    result = transfer_file(
+        url=str(chosen["url"]),
+        dest=dest / Path(str(chosen["path"])).name,
+        expected_bytes=int(chosen["bytes"]),
+        expected_sha256=str(chosen["sha256"]),
+        deadline=deadline,
+    )
+    result.update({"stage": "download", "download": result.get("started_transfer") is True, "file": chosen["path"]})
+    return result
 
 
 def _import_one(name: str) -> dict[str, Any]:

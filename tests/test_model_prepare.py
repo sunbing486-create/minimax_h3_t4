@@ -6,7 +6,7 @@ from pathlib import Path
 
 from minimax_h3_t4.runtime.checkpoint_budget import LazyCheckpoint
 from minimax_h3_t4.runtime.model_facts import LAST_ADMISSION_AVAILABLE_BYTES, align_frame_count, memory_facts, minimum_legal_sample
-from scripts.prepare_model_stage import build_plan, clone_comfy, protected_replacements, refuse_or_plan_download
+from scripts.prepare_model_stage import build_plan, clone_comfy, download_official, protected_replacements
 
 
 class _Tensor:
@@ -74,7 +74,7 @@ def test_pip_plan_refuses_a_transitive_torch_upgrade() -> None:
 
 
 def test_download_stays_off_without_explicit_confirmation(tmp_path: Path) -> None:
-    refused = refuse_or_plan_download(confirm=False, only="minimax_h3_audio_vae_fp32.safetensors", dest_dir=str(tmp_path))
+    refused = download_official(confirm=False, enable_transfer=False, only="minimax_h3_audio_vae_fp32.safetensors", dest_dir=str(tmp_path), deadline=0)
     assert refused["download"] is False
     assert refused["started_transfer"] is False
     assert refused["ok"] is False
