@@ -1,0 +1,7 @@
+# Weight-free H3T4Worker actor admission only.
+# Do not install torch, torchvision, torchaudio, or ray from this file.
+# The bootstrap pins whatever torch/ray are already installed and refuses to change them.
+xfuser==0.4.5
+yunchang==0.6.4
+transformers==5.0.0
+diffusers==0.37.1

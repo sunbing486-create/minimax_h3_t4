@@ -1,0 +1,6 @@
+# Weight-free two-GPU probe only.
+# The Kaggle GPU notebook already has a CUDA torch build. Do not replace it
+# with a CPU wheel, and do not install ray, safetensors, or any model package
+# for this probe. The probe imports torch from the existing environment.
+# Python >= 3.10
+# No third-party packages are required beyond that existing torch.

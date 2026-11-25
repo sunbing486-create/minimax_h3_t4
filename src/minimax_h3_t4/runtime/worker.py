@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import gc
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
-from .checkpoint import load_int8_checkpoint_mmap, normalize_state_dict_prefix, require_int8_state_dict
+from .checkpoint import normalize_state_dict_prefix, require_int8_state_dict
 from .topology import ExactH3T4Topology
-from .diag_logger import log_memory, log_fsdp_shard_state, log_host, log_tensor
+from .diag_logger import log_memory, log_fsdp_shard_state, log_host
 
 
 def validate_worker_config(config: dict[str, object]) -> None:
@@ -96,6 +97,95 @@ def _patch_psutil() -> None:
     psutil.virtual_memory = virtual_memory
 
 
+def worker_import_snapshot(module_names: list[str], checkpoint_dir: str, checkpoint_file: str | None = None, load_entry: bool = False) -> dict[str, Any]:
+    """Run inside a Ray worker. Report imports from that process only."""
+
+    import importlib
+    import importlib.metadata as metadata
+
+    rows = []
+    for name in module_names:
+        try:
+            module = importlib.import_module(name)
+        except ModuleNotFoundError as exc:
+            rows.append({"name": name, "status": "missing_module", "error_type": "ModuleNotFoundError", "message": str(exc), "file": None})
+            continue
+        except (AssertionError, NotImplementedError) as exc:
+            text = str(exc)
+            status = "cpu_cuda_unavailable" if ("CUDA" in text or "Accelerator" in text or "No Accelerators" in text) else "error"
+            rows.append({"name": name, "status": status, "error_type": type(exc).__name__, "message": text[:240], "file": None})
+            continue
+        except Exception as exc:
+            text = str(exc)
+            status = "cpu_cuda_unavailable" if ("CUDA" in text or "cuda" in text) else "error"
+            rows.append({"name": name, "status": status, "error_type": type(exc).__name__, "message": text[:240], "file": None})
+            continue
+        rows.append({"name": name, "status": "imported", "file": getattr(module, "__file__", None)})
+    versions = {}
+    for dist_name in ("torch", "torchvision", "torchaudio", "ray", "xfuser", "yunchang"):
+        try:
+            versions[dist_name] = metadata.version(dist_name)
+        except metadata.PackageNotFoundError:
+            versions[dist_name] = None
+    cuda_count = 0
+    try:
+        import torch
+
+        cuda_count = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        cuda_count = 0
+    directory = Path(checkpoint_dir)
+    writable = False
+    write_error = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / ".h3-worker-path-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        writable = True
+    except OSError as exc:
+        write_error = f"{type(exc).__name__}: {exc}"
+    readable = None
+    checkpoint_bytes = None
+    if checkpoint_file:
+        target = Path(checkpoint_file)
+        try:
+            checkpoint_bytes = target.stat().st_size
+            with target.open("rb") as handle:
+                handle.read(8)
+            readable = True
+        except OSError as exc:
+            readable = False
+            write_error = f"{type(exc).__name__}: {exc}"
+    report = {
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "pythonpath": os.environ.get("PYTHONPATH"),
+        "imports": rows,
+        "versions": versions,
+        "cuda_count": cuda_count,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "checkpoint_dir": str(directory),
+        "checkpoint_dir_writable": writable,
+        "checkpoint_readable": readable,
+        "checkpoint_bytes": checkpoint_bytes,
+        "path_error": write_error,
+        "weight_alignment": "unknown",
+    }
+    if load_entry:
+        from .load_entry import import_unet_load_entry
+
+        report["load_entry"] = import_unet_load_entry()
+    return report
+
+
+def _materialize_checkpoint_key(path: str, key: str) -> Any:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        return handle.get_tensor(key)
+
+
 class H3T4Worker:
     """One rank of the fixed two-T4 FSDP + Ulysses MiniMax-H3 runtime."""
 
@@ -106,7 +196,76 @@ class H3T4Worker:
         self.model = None
         self.device_mesh = None
         self.spectrum_controller = None
-        self._initialize_distributed()
+        self.distributed_ready = False
+        self._unet_path: str | None = None
+        self.load_trace: list[dict[str, Any]] = []
+        self._rank_log("actor_init")
+
+    def ready(self) -> dict[str, object]:
+        """Return once this process exists, before any collective.
+
+        The parent waits for every rank to reach this point and only then
+        calls ``join_process_group``. Doing the rendezvous inside ``__init__``
+        lets rank 0 block before rank 1 has a process.
+        """
+
+        self._persist_sample("ready")
+        self._rank_log("ready")
+        return {
+            "rank": self.rank,
+            "pid": os.getpid(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "distributed_ready": self.distributed_ready,
+        }
+
+    def join_process_group(self) -> dict[str, object]:
+        self._rank_log("join_begin")
+        if not self.distributed_ready:
+            self._initialize_distributed()
+            self.distributed_ready = True
+        report = self._prove_nccl_without_weights()
+        self._rank_log("join_end")
+        return report
+
+    def _prove_nccl_without_weights(self) -> dict[str, object]:
+        """One scalar allreduce after the process group exists. No checkpoint is read."""
+
+        import torch
+        import torch.distributed as dist
+
+        if self.model is not None:
+            raise RuntimeError("actor admission must finish before any weight is loaded")
+        tensor = torch.tensor([self.rank + 2], dtype=torch.int64, device=self.device)
+        dist.all_reduce(tensor)
+        props = torch.cuda.get_device_properties(self.device)
+        return {
+            "rank": self.rank,
+            "status": "joined",
+            "pid": os.getpid(),
+            "sum": int(tensor.item()),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "device_name": str(getattr(props, "name", "")),
+            "device_uuid": str(getattr(props, "uuid", "") or getattr(props, "pci_bus_id", "")),
+            "weights_loaded": False,
+        }
+
+    def _persist_sample(self, label: str) -> None:
+        from .unet_load import persist_process_sample
+
+        self.load_trace.append(persist_process_sample(os.environ.get("H3_T4_EVIDENCE_DIR"), label, rank=self.rank))
+
+    def _rank_log(self, message: str) -> None:
+        line = f"{datetime.now(timezone.utc).isoformat(timespec='milliseconds')} rank={self.rank} {message}\n"
+        print(line, end="", flush=True)
+        root = os.environ.get("H3_T4_EVIDENCE_DIR")
+        if not root:
+            return
+        path = Path(root) / "ranks" / f"rank{self.rank}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _initialize_distributed(self) -> None:
         import torch
@@ -114,6 +273,7 @@ class H3T4Worker:
         from xfuser.core.distributed import init_distributed_environment, initialize_model_parallel
 
         from .int8 import require_tesla_t4
+        from .placement import assert_single_visible_gpu
 
         # Kaggle reports 32GB but only has ~30GB usable. Patch psutil so
         # ComfyUI computes conservative memory budgets and stops trying to
@@ -122,14 +282,20 @@ class H3T4Worker:
 
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
+        assert_single_visible_gpu(int(torch.cuda.device_count()), os.environ.get("CUDA_VISIBLE_DEVICES"), self.rank)
         require_tesla_t4(torch, self.device)
         if not dist.is_initialized():
+            from .startup import rendezvous_endpoint
+
+            master_addr, master_port = rendezvous_endpoint(self.config)
+            os.environ["MASTER_ADDR"] = master_addr
+            os.environ["MASTER_PORT"] = master_port
             dist.init_process_group(
                 "nccl",
                 rank=self.rank,
                 world_size=2,
                 timeout=timedelta(minutes=2),
-                init_method=(f"tcp://{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{os.environ.get('MASTER_PORT', '29500')}"),
+                init_method=f"tcp://{master_addr}:{master_port}",
             )
         self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(2,))
         init_distributed_environment(rank=self.rank, world_size=2, local_rank=0, backend="nccl")
@@ -143,6 +309,20 @@ class H3T4Worker:
         )
 
     def load_unet(self, path: str, weight_dtype: str) -> bool:
+        self._last_load_error = None
+        self._persist_sample("load_unet_enter")
+        self._rank_log(f"load_unet_enter pid={os.getpid()} cvd={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+        try:
+            return self._load_unet_impl(path, weight_dtype)
+        except BaseException as exc:
+            self._last_load_error = {"error_type": type(exc).__name__, "message": str(exc)[:500]}
+            self._persist_sample("load_unet_failed")
+            self._rank_log(f"load_unet_failed {type(exc).__name__}: {exc}")
+            raise
+
+    def _load_unet_impl(self, path: str, weight_dtype: str) -> bool:
+        if not self.distributed_ready:
+            raise RuntimeError("join_process_group must succeed before loading weights")
         if weight_dtype != "int8":
             raise ValueError("MiniMax-H3 two-T4 worker is INT8-only")
         import comfy.model_detection
@@ -151,7 +331,7 @@ class H3T4Worker:
         import comfy.utils
         import torch
 
-        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict
+        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict, register_absent_weight_parameters
         from .h3_forward import h3_ulysses_attention, h3_ulysses_forward
         from .int8 import install_int8_cuda_oom_retry
         from .ulysses import inject_minimax_h3_ulysses
@@ -162,29 +342,58 @@ class H3T4Worker:
         # RAM peak on constrained Kaggle hosts.
         import comfy.utils as _cu
         _cu.MMAP_TORCH_FILES = True
-        log_memory("load_unet_start", extra={"cpu_offload": cpu_offload})
+        from .checkpoint_budget import LazyCheckpoint, host_available_bytes, read_safetensors_header, sequential_resident_plan
+        from .unet_load import sample_process_memory
+
+        self.load_trace.append(sample_process_memory("before_construct"))
+        if host_available_bytes() < 2 * 1024**3:
+            raise MemoryError("available memory fell below 2GiB before UNet construction")
+        header = read_safetensors_header(path)
+        load_plan = sequential_resident_plan(
+            file_bytes=int(header["total_bytes"]),
+            max_tensor_bytes=int(header["max_tensor_bytes"]),
+            host_available_bytes=host_available_bytes(),
+        )
+        log_memory("load_unet_start", extra={"cpu_offload": cpu_offload, "load_plan": load_plan})
         log_host("load_unet_start")
-        state_dict, metadata = load_int8_checkpoint_mmap(path)
+        if not load_plan["streaming_second_rank_fits"]:
+            raise MemoryError(
+                "refusing to materialize the UNet: streaming shard peak "
+                f"{load_plan['streaming_second_rank_peak_bytes']} bytes does not fit "
+                f"{load_plan['host_available_bytes']} available bytes. "
+                f"Old full-file peak would be {load_plan['old_second_rank_peak_bytes']} bytes "
+                f"(fits={load_plan['old_second_rank_fits']})."
+            )
+        file_keys = [item["key"] for item in header["tensors"]]
+        prefix = "diffusion_model." if any(key.startswith("diffusion_model.") for key in file_keys) else ""
+        if not prefix and any(key.startswith("model.") for key in file_keys):
+            prefix = "model."
+        state_dict = LazyCheckpoint(lambda key: _materialize_checkpoint_key(path, key), file_keys, prefix=prefix)
+        metadata = {}
         require_int8_state_dict(state_dict)
-        log_memory("after_checkpoint_load", extra={"num_tensors": len(state_dict)})
+        state_dict.release_materialized()
+        log_memory("after_checkpoint_load", extra={"num_tensors": len(state_dict), "materialized": len(state_dict.materialized_keys)})
         log_host("after_checkpoint_load")
-        prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)
-        state_dict = normalize_state_dict_prefix(state_dict, prefix)
         state_dict, metadata = comfy.utils.convert_old_quants(state_dict, "", metadata=metadata)
         config = comfy.model_detection.model_config_from_unet(state_dict, "", metadata=metadata)
         if config is None:
             raise ValueError("Checkpoint is not a native ComfyUI MiniMax-H3 model")
-        model = config.get_model(state_dict, "")
+        state_dict.release_materialized()
+        # Comfy allocates every Linear at construction unless aimdo is on.
+        # Kaggle's f481 audit did not have comfy_aimdo, so that path would
+        # reserve the full parameter storage. meta keeps the shapes and skips
+        # the physical allocation; FSDP materializes each shard afterwards.
+        model = config.get_model(state_dict, "", torch.device("meta"))
+        self.load_trace.append(sample_process_memory("after_meta_construct"))
         from comfy.model_base import MiniMaxH3
 
         if not isinstance(model, MiniMaxH3):
             raise TypeError(f"Expected MiniMaxH3 checkpoint, detected {type(model).__name__}")
         load_device = comfy.model_management.get_torch_device()
         offload_device = comfy.model_management.unet_offload_device()
-        model.load_model_weights(state_dict, "", assign=True)
-        # Drop the checkpoint now that the model owns its weights.
-        # This avoids a second ~12GB allocation when we build `full_state`.
-        del state_dict
+        # load_model_weights pops every key into one dict before load_state_dict.
+        # That would hold the whole UNet at once and would empty the lazy map
+        # before FSDP reads it. FSDP below loads one key at a time.
         gc.collect()
         torch.cuda.empty_cache()
         log_memory("after_model_init", extra={"model_params": sum(p.numel() for p in model.parameters())})
@@ -194,13 +403,12 @@ class H3T4Worker:
 
         patcher_class = h3_fsdp_patcher_class(comfy.model_patcher.ModelPatcher)
         patcher = patcher_class(model, load_device, offload_device, size=local_model_size, cpu_offload=cpu_offload)
-        full_state = normalize_state_dict_prefix(
-            patcher.model_state_dict(filter_prefix="diffusion_model."),
-            "diffusion_model.",
-        )
-        log_memory("before_fsdp_shard", extra={"full_state_keys": len(full_state)})
+        full_state = state_dict
+        log_memory("before_fsdp_shard", extra={"full_state_keys": len(full_state), "materialized": len(state_dict.materialized_keys)})
+        self.load_trace.append(sample_process_memory("before_shard"))
         log_host("before_fsdp_shard")
         diffusion = model.diffusion_model
+        self._registered_absent_weights = register_absent_weight_parameters(diffusion)
         diffusion.to("meta")
         fsdp_kwargs: dict[str, Any] = {"mesh": self.device_mesh, "reshard_after_forward": True}
         if cpu_offload:
@@ -213,7 +421,7 @@ class H3T4Worker:
             native_ignore_scale=False,
         )
         log_fsdp_shard_state(diffusion, "post_shard")
-        load_from_full_model_state_dict(
+        self._key_report = load_from_full_model_state_dict(
             diffusion,
             full_state,
             self.device,
@@ -234,9 +442,61 @@ class H3T4Worker:
         log_memory("load_unet_complete")
         log_host("load_unet_complete")
         self.model = patcher
+        self._unet_path = path
+        self.load_trace.append(sample_process_memory("load_complete"))
         return True
 
+    def load_diagnostics(self) -> dict[str, Any]:
+        """Return samples already taken. This does not invent a GPU peak."""
+
+        trace = list(getattr(self, "load_trace", []))
+        used = []
+        for row in trace:
+            for gpu in row.get("gpus") or []:
+                text = str(gpu.get("memory_used_mib", "")).strip()
+                if text.isdigit():
+                    used.append(int(text))
+        return {
+            "rank": self.rank,
+            "pid": os.getpid(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "trace": trace,
+            "error": getattr(self, "_last_load_error", None),
+            "sampled_max_gpu_memory_used_mib": max(used) if used else None,
+            "sampled_max_is_not_a_continuous_profiler_peak": True,
+            "logical_bytes_are_not_a_measured_peak": True,
+            "weight_alignment": "unknown",
+        }
+
+    def shard_report(self) -> dict[str, Any]:
+        from .unet_load import bounded_weight_check, counted_module, load_integrity, sample_process_memory, summarize_module_storage
+
+        storage = summarize_module_storage(self.model)
+        key_report = getattr(self, "_key_report", None)
+        weight_check = bounded_weight_check(counted_module(self.model), getattr(self, "_unet_path", None), rank=self.rank, world_size=2)
+        return {
+            "storage": storage,
+            "registered_absent_weights": getattr(self, "_registered_absent_weights", 0),
+            "key_report": key_report,
+            "weight_check": weight_check,
+            "integrity": load_integrity(storage, weight_check, key_report),
+            "process": sample_process_memory("shard_report"),
+            "trace": list(getattr(self, "load_trace", [])),
+            "loaded": storage["materialized_bytes"] > 0 and storage["meta_bytes"] < storage["logical_bytes"],
+            "video_inference_claimed": False,
+        }
+
     def load_unet_from_state_dict(self, state_dict_ref: Any, weight_dtype: str) -> bool:
+        """Load model from an already-loaded state dict (broadcast from main process).
+
+        This avoids the double-RAM peak when multiple workers each load the full checkpoint.
+        Each worker resolves its own reference from the shared state dict via Ray Object Store.
+        """
+        if not self.distributed_ready:
+            raise RuntimeError("join_process_group must succeed before loading weights")
+        return self._load_unet_from_state_dict(state_dict_ref, weight_dtype)
+
+    def _load_unet_from_state_dict(self, state_dict_ref: Any, weight_dtype: str) -> bool:
         """Load model from an already-loaded state dict (broadcast from main process).
 
         This avoids the double-RAM peak when multiple workers each load the full checkpoint.
@@ -250,7 +510,7 @@ class H3T4Worker:
         import comfy.model_patcher
         import comfy.utils
 
-        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict
+        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict, register_absent_weight_parameters
         from .h3_forward import h3_ulysses_attention, h3_ulysses_forward
         from .int8 import install_int8_cuda_oom_retry
         from .ulysses import inject_minimax_h3_ulysses
@@ -268,7 +528,7 @@ class H3T4Worker:
 
         install_int8_cuda_oom_retry(torch)
         cpu_offload = bool(self.config.get("fsdp_cpu_offload", False))
-        
+
         # Use the shared state dict directly - no disk load needed
         require_int8_state_dict(state_dict)
         prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)
@@ -299,6 +559,7 @@ class H3T4Worker:
             "diffusion_model.",
         )
         diffusion = model.diffusion_model
+        self._registered_absent_weights = register_absent_weight_parameters(diffusion)
         diffusion.to("meta")
         fsdp_kwargs: dict[str, Any] = {"mesh": self.device_mesh, "reshard_after_forward": True}
         if cpu_offload:
@@ -310,7 +571,7 @@ class H3T4Worker:
             fsdp_kwargs=fsdp_kwargs,
             native_ignore_scale=False,
         )
-        load_from_full_model_state_dict(
+        self._key_report = load_from_full_model_state_dict(
             diffusion,
             full_state,
             self.device,

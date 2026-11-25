@@ -200,6 +200,12 @@ def _get_parent_module_and_name(model: torch.nn.Module, param_name: str) -> tupl
     return model.get_submodule(parent_name), leaf_name
 
 
+def _checkpoint_dtype(full_tensor: torch.Tensor, meta_param: torch.Tensor) -> torch.dtype:
+    if full_tensor.is_floating_point():
+        return full_tensor.dtype
+    return meta_param.dtype
+
+
 def _maybe_collapse_replicated_leading_dim(full_tensor: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     expected_shape = tuple(target_shape)
     if tuple(full_tensor.shape) == expected_shape:
@@ -234,9 +240,11 @@ def _materialize_unsharded_param(
     cpu_offload: bool,
 ) -> None:
     full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, meta_param.shape)
-    # When CPU offloading, load directly to CPU to avoid a transient GPU spike
+    # When CPU offloading, load directly to CPU to avoid a transient GPU spike.
+    # Keep the checkpoint floating dtype. The meta placeholder is often float32
+    # while the official UNet stores BF16 and F16.
     target_device = torch.device("cpu") if cpu_offload else device
-    full_tensor = full_tensor.to(dtype=meta_param.dtype, device=target_device)
+    full_tensor = full_tensor.to(dtype=_checkpoint_dtype(full_tensor, meta_param), device=target_device)
     parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
     parent_module.register_parameter(
         leaf_name,
@@ -551,6 +559,103 @@ def _wrap_quantized_local_as_dtensor(
 # Heavily modified from
 # https://github.com/meta-pytorch/torchtune/blob/d0f63bb33d00b8bd3905a010b71d8c6324c2e980/torchtune/training/_distributed.py#L336
 # Need to be done since dcp loader cause wrong dtype among rank when broadcasting.
+def _note_missing(report: dict[str, Any], param_name: str, strict: bool) -> None:
+    report["missing"] += 1
+    names = report["missing_names"]
+    if len(names) < 20:
+        names.append(param_name)
+    if strict:
+        raise ValueError(f"Missing parameter {param_name} in state_dict")
+
+
+def register_absent_weight_parameters(model: torch.nn.Module) -> int:
+    """Give Comfy quantized layers a meta weight so the loader can see the key.
+
+    ``mixed_precision_ops.Linear`` leaves ``weight`` unset until
+    ``_load_from_state_dict``. ``state_dict()`` then omits the checkpoint key,
+    and the FSDP loader never reads it.
+    """
+
+    registered = 0
+    for module in model.modules():
+        shape = getattr(module, "_orig_shape", None)
+        if not isinstance(shape, tuple) or not shape:
+            continue
+        if getattr(module, "weight", None) is not None:
+            continue
+        dtype = getattr(module, "factory_kwargs", {}).get("dtype") or torch.float32
+        module.weight = torch.nn.Parameter(torch.empty(shape, device="meta", dtype=dtype), requires_grad=False)
+        registered += 1
+    return registered
+
+
+def _stored_tensor(module: torch.nn.Module, leaf: str, *, is_buffer: bool) -> torch.Tensor | None:
+    if is_buffer:
+        return module.get_buffer(leaf)
+    if leaf not in module._parameters:
+        return None
+    return module.get_parameter(leaf)
+
+
+def _is_meta_storage(tensor: torch.Tensor | None) -> bool:
+    if tensor is None:
+        return True
+    data = getattr(tensor, "_local_tensor", None)
+    if data is None:
+        data = tensor
+    qdata = getattr(data, "_qdata", None)
+    if qdata is not None:
+        data = qdata
+    return getattr(getattr(data, "device", None), "type", "meta") == "meta"
+
+
+def _rewrap_fsdp(local_tensor: torch.Tensor, sharded_meta_param: torch.Tensor) -> torch.Tensor:
+    """Put a real local shard back under the FSDP DTensor spec.
+
+    ``DTensor.from_local`` on a ConvRot INT8 ``QuantizedTensor`` dequantizes
+    through ``view_as``. The constructor keeps the quantized storage and gives
+    the pre-forward hook a mesh. A bare ``Parameter`` does not.
+    """
+
+    if not hasattr(sharded_meta_param, "device_mesh"):
+        return local_tensor
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+
+    old = sharded_meta_param._spec
+    meta = old.tensor_meta
+    spec = DTensorSpec(
+        old.mesh,
+        tuple(old.placements),
+        tensor_meta=TensorMeta(meta.shape, meta.stride, local_tensor.dtype),
+    )
+    return DTensor(local_tensor, spec, requires_grad=False)
+
+
+def _install_tensor(module: torch.nn.Module, leaf: str, tensor: torch.Tensor, *, is_buffer: bool) -> None:
+    """Replace the parameter object. Copying into a meta tensor is a no-op."""
+
+    if is_buffer:
+        value = tensor.detach() if isinstance(tensor, torch.nn.Parameter) else tensor
+        module.register_buffer(leaf, value)
+    else:
+        parameter = tensor if isinstance(tensor, torch.nn.Parameter) else torch.nn.Parameter(tensor, requires_grad=False)
+        module.register_parameter(leaf, parameter)
+
+
+def _note_installed(report: dict[str, Any], module: torch.nn.Module, leaf: str, *, is_buffer: bool) -> None:
+    stored = _stored_tensor(module, leaf, is_buffer=is_buffer)
+    report.setdefault("resident", 0)
+    report.setdefault("still_meta", 0)
+    report.setdefault("still_meta_names", [])
+    if _is_meta_storage(stored):
+        report["still_meta"] += 1
+        if len(report["still_meta_names"]) < 20:
+            report["still_meta_names"].append(leaf)
+        return
+    report["resident"] += 1
+
+
 def load_from_full_model_state_dict(
     model,
     full_sd,
@@ -560,17 +665,18 @@ def load_from_full_model_state_dict(
     release_sd=True,
 ):
     meta_sharded_sd = model.state_dict()
-    sharded_sd: dict[str, torch.Tensor] = {}
+    report = {"requested": 0, "matched": 0, "missing": 0, "missing_names": [], "resident": 0, "still_meta": 0, "still_meta_names": []}
     for param_name, sharded_meta_param in meta_sharded_sd.items():
+        report["requested"] += 1
         parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
         is_buffer = leaf_name in parent_module._buffers
         if not is_buffer and _should_materialize_unsharded_param(param_name, sharded_meta_param, full_sd):
             full_tensor = full_sd.get(param_name)
             if full_tensor is None:
-                if strict:
-                    raise ValueError(f"Missing parameter {param_name} in state_dict")
+                _note_missing(report, param_name, strict)
                 continue
             _materialize_unsharded_param(model, param_name, sharded_meta_param, full_tensor, device, cpu_offload)
+            _note_installed(report, parent_module, leaf_name, is_buffer=False)
             if release_sd:
                 full_sd[param_name] = None
             continue
@@ -580,30 +686,35 @@ def load_from_full_model_state_dict(
             if quant_tensor is None:
                 debug_info = _quant_payload_debug_info(param_name, full_sd)
                 raise ValueError(f"Expected quantized tensor for {param_name}, but could not build it ({debug_info})")
-            if hasattr(sharded_meta_param, "device_mesh"):
-                sharded_tensor = _wrap_quantized_local_as_dtensor(
-                    quant_tensor,
-                    sharded_meta_param,
-                )
-            else:
-                sharded_tensor = quant_tensor
             if cpu_offload:
-                sharded_tensor = sharded_tensor.cpu()
-            sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+                quant_tensor = quant_tensor.cpu()
+            elif getattr(getattr(quant_tensor, "_qdata", quant_tensor), "device", None) != device:
+                quant_tensor = quant_tensor.to(device)
+            _install_tensor(
+                parent_module,
+                leaf_name,
+                _rewrap_fsdp(quant_tensor, sharded_meta_param),
+                is_buffer=False,
+            )
+            _note_installed(report, parent_module, leaf_name, is_buffer=False)
             if release_sd:
                 _release_quant_keys(full_sd, param_name)
             continue
         full_tensor = full_sd.get(param_name)
         if full_tensor is None:
-            if strict:
-                raise ValueError(f"Missing parameter {param_name} in state_dict")
+            _note_missing(report, param_name, strict)
             continue
+        if (not full_tensor.is_floating_point()) and sharded_meta_param.is_floating_point():
+            raise RuntimeError(
+                f"{param_name} is {full_tensor.dtype} checkpoint storage and the placeholder is {sharded_meta_param.dtype}; "
+                "refusing to expand integer data into a floating tensor"
+            )
         if not hasattr(sharded_meta_param, "device_mesh"):
             full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, sharded_meta_param.shape)
-            full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
+            full_tensor = full_tensor.to(dtype=_checkpoint_dtype(full_tensor, sharded_meta_param), device=device)
             sharded_tensor = full_tensor
         else:
-            full_tensor = full_tensor.to(sharded_meta_param.dtype)
+            full_tensor = full_tensor.to(dtype=_checkpoint_dtype(full_tensor, sharded_meta_param))
             local_dense = _shard_tensor(full_tensor, sharded_meta_param, device)
             sharded_tensor = DTensor.from_local(
                 local_dense,
@@ -612,9 +723,12 @@ def load_from_full_model_state_dict(
             )
         if cpu_offload:
             sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[param_name] = sharded_tensor if is_buffer else torch.nn.Parameter(sharded_tensor)
+        _install_tensor(parent_module, leaf_name, sharded_tensor, is_buffer=is_buffer)
+        _note_installed(report, parent_module, leaf_name, is_buffer=is_buffer)
         if release_sd:
             full_sd[param_name] = None
-    out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
     _materialize_missing_ignored_params(model, full_sd, device, strict, cpu_offload, release_sd)
-    return out
+    report["load_state_dict_missing"] = []
+    report["load_state_dict_unexpected"] = []
+    report["matched"] = report["resident"]
+    return report

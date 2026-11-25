@@ -1,0 +1,22 @@
+Evidence recovery
+
+The probe rewrites these files as soon as a stage finishes or fails. It does not wait for a notebook pin or a model download.
+
+/kaggle/working/h3-weightfree-evidence/failure/evidence.zip
+/kaggle/working/h3-weightfree-evidence/failure/evidence.zip.sha256
+/kaggle/working/h3-weightfree-evidence/failure/smoke_result.json
+
+/kaggle/working/h3-weightfree-evidence/nccl/evidence.zip
+/kaggle/working/h3-weightfree-evidence/nccl/evidence.zip.sha256
+/kaggle/working/h3-weightfree-evidence/nccl/smoke_result.json
+
+Download each zip and its sidecar from the Kaggle Output browser to the parent machine. Then run sha256sum on the downloaded zip and compare it to the sidecar. A zip that exists only inside the Kaggle container is not recovered evidence.
+
+The zip contains events.jsonl, status.json, error.txt when a failure was recorded, processes.json, and that attempt's control directory. Each attempt uses a new control directory, so an older successful attempt cannot satisfy a later run.
+
+Timeouts:
+- failure drill: ready 2s, collective 2s, both ranks held for 30s, then the parent kills both children and exits 2
+- real probe: ready 60s, collective 90s
+On either timeout the children are terminated and the zip is rewritten. Do not leave the notebook waiting on a prompt or a weight download.
+
+Stop the Kaggle session only after the parent machine has the zip and the sha256 matches. If the Output download is empty, keep the session up and copy the files another loopback-local way; do not treat the in-container files as saved.

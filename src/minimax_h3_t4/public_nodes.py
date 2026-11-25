@@ -235,6 +235,12 @@ class H3T4Sampler:
             )
         except BaseException as exc:
             primary_error = exc
+            try:
+                from .runtime.evidence import note_failure
+
+                note_failure(exc)
+            except Exception:
+                pass
             raise
         finally:
             if group is not None and getattr(group, "alive", False):
@@ -246,3 +252,9 @@ class H3T4Sampler:
                     add_note = getattr(primary_error, "add_note", None)
                     if callable(add_note):
                         add_note(f"Secondary worker teardown failure: {type(close_exc).__name__}: {close_exc}")
+            try:
+                from .runtime.evidence import finalize_active
+
+                finalize_active()
+            except Exception:
+                pass

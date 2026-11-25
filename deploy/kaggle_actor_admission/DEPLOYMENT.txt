@@ -1,0 +1,61 @@
+Actor admission deployment
+
+Project commit: COMMIT.txt in the uploaded folder is the git revision of that folder.
+The CPU session run that reached NOT_RUN_GPU_GATE was commit 255e4c2df44eba64c4984dbc5b68fcd5aa3faa60.
+This package adds path discovery on top of that run. It does not record a GPU actor pass.
+ComfyUI revision 2fcb6cef9ab1b6dc556b7cff1765a0724ad5e884 is the historical GPU host.
+It is not required for actor admission and this bootstrap does not clone it.
+
+H3T4Worker.join_process_group imports torch and xfuser.core.distributed, then calls
+init_distributed_environment and initialize_model_parallel. On a GPU that call also
+imports yunchang. comfy and folder_paths are imported only by load_unet, so a missing
+ComfyUI checkout does not block actor admission. Missing weight files do not block it.
+Missing xfuser or yunchang does.
+
+On a CPU torch build, importing xfuser.core.distributed raises
+NotImplementedError: No Accelerators available. That is xfuser's own accelerator
+check, not a missing module. The CPU check may still set
+materials_ready_for_gpu_stage true. gpu_stage_permitted stays false until
+cuda.device_count is 2. actor_admission_passed stays false until the GPU command
+below actually returns.
+
+Persistence: Kaggle "No persistence" drops /tmp and /kaggle/working when the session
+stops. Upload this directory as a Kaggle dataset input and run from that input path
+on both the CPU session and the later GPU session. Do not treat /tmp as the code source.
+The input mount is read-only. Ray working_dir, session logs, and the zipped
+py_modules are written under /tmp/h3-ray-runtime, or under H3_T4_RUNTIME_DIR when
+that variable is set. They are not created beside src.
+
+Evidence from one command is /kaggle/working/h3-actor-session/session-status.json
+and actor-result.json. The downloadable bundle is the sibling
+/kaggle/working/h3-actor-session-evidence.zip plus its .sha256 file. The final
+record is the sibling h3-actor-session-manifest.json. The copy of
+session-status.json inside the zip is the pre-seal snapshot and says
+NOT_SEALED; that is not a failed bundle when the manifest says SEALED and the
+sidecar matches the zip. The notebook prints those names, sizes, and the hash,
+and shows FileLinks. actor_admission_passed
+is true only when the admission file records the collective, distinct GPUs, no
+weights, cleanup closed, and the actor process exits 0. A file claim with a
+non-zero exit remains visible as ACTOR_FAILED_AFTER_CLAIM and is not a pass.
+
+Stage A, CPU session, no actors
+1. Open the dataset that contains this folder. Do not start a GPU.
+2. python scripts/bootstrap_actor_admission.py --stage plan --report /kaggle/working/bootstrap-plan.json
+   If ok is false because torch would change, stop. Do not apply.
+3. python scripts/bootstrap_actor_admission.py --stage apply --report /kaggle/working/bootstrap-apply.json
+4. python scripts/bootstrap_actor_admission.py --stage check --report /kaggle/working/bootstrap-check.json
+   Download those three JSON files before stopping. actor_admission_passed must stay false.
+   cuda.kind on this CPU image should be cpu_build. That is a CPU result, not a failed install
+   and not a passed GPU admission.
+
+Stage B, new GPU session
+Do not paste Python into the browser. Run All on kaggle_gpu_session.ipynb, or:
+  python scripts/run_actor_session.py --evidence-dir /kaggle/working/h3-actor-session --budget-s 240
+The script runs plan, apply, check, then actor. Check timeout is fixed at 75 seconds and is never lowered. Actor starts only if check saw two CUDA devices and at least 125 seconds remain. Actor limits are ready 45, collective 60, cleanup 20. Otherwise the status is NOT_RUN_BUDGET or NOT_RUN_GPU_GATE, and actor_admission_passed stays false.
+The command stage is capped at 240 seconds so the zip can be downloaded before shutdown. A previous GPU attempt used about 6 minutes of session time and killed check at 29 seconds, so check.json was never written and actors never started.
+No persistence: pip from the CPU session is gone. This command bootstraps again. Optional wheels/ next to the script are official xfuser, yunchang, transformers, and diffusers wheels, about 15MB, and are used with pip --find-links. They do not replace torch or ray.
+Do not run a second hand-written actor cell. The entry script starts H3T4Initializer and H3T4Worker only after the GPU gate. Download /kaggle/working/h3-actor-session/session-evidence.zip and its sha256 before stopping.
+Do not run model-load. Weights are missing; a model-load exit code is not this test.
+
+Pip must not replace torch or torchvision. Ray stays at the image version.
+No model download, no dataset publish, no public port.

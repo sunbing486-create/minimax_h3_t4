@@ -1,0 +1,16 @@
+Weight-free dual-GPU probe checklist
+Commit: see COMMIT.txt in this folder after the artifact is built, or git rev-parse HEAD of the fork branch cursor/fix-dual-rank-startup-4868.
+Do not download MiniMax-H3 weights before this probe passes. Do not open a public tunnel. Bind nothing except 127.0.0.1.
+
+1. Upload this folder to the Kaggle GPU session. Confirm src/minimax_h3_t4/runtime/dual_gpu_probe.py exists inside it.
+2. Evidence must be written under /kaggle/working so Output can download it. Do not use only /tmp.
+3. Failure drill, first, in its own directory:
+   PYTHONPATH=src python scripts/dual_gpu_smoke.py --mode cuda-nccl --evidence-dir /kaggle/working/h3-weightfree-evidence/failure --ready-timeout 2 --collective-timeout 2 --hold-seconds 30
+   Expect exit code 2 within a few seconds. Two child processes must not remain. evidence.zip and evidence.zip.sha256 must exist. smoke_result.json must have collective_ok false and model_stage_allowed false.
+4. On the parent machine, download those three files and check sha256sum against the sidecar. If the download fails, the files are not preserved. Do not start the real probe and do not stop the session until this download succeeds.
+5. Real probe, separate directory, no hold:
+   PYTHONPATH=src python scripts/dual_gpu_smoke.py --mode cuda-nccl --evidence-dir /kaggle/working/h3-weightfree-evidence/nccl --ready-timeout 60 --collective-timeout 90
+   Pass only when the JSON shows collective_ok true, distinct_gpu_mapping true, device_count 2, weights_loaded false, and the two device_uuid values differ. CUDA_VISIBLE_DEVICES must be 0 for one rank and 1 for the other.
+6. Download the nccl evidence zip and verify its sha256 before stopping the session.
+7. A CPU, mock, or builtin-cpu result does not pass this checklist. This environment cannot certify NCCL.
+8. Reuse a weight file only when inspect_local_weight reports reusable true for an on-disk file and a matching sha256. Do not run hf_hub_download or snapshot_download from this probe.

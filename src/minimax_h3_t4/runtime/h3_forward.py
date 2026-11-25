@@ -13,7 +13,6 @@ from comfy.ldm.minimax.model import (
     patchify_video,
     rope_rotation_table,
     time_shift_sigma,
-    time_shift_slope,
     unpack_audio,
     unpatchify_video,
     PackedLayout,
@@ -22,21 +21,27 @@ from comfy.ldm.minimax.model import (
 )
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
+from .schedule import time_shift_slope
+
 from .attention import make_ulysses_attention
 from .memory_trace import memory_snapshot as _mem_snapshot, memory_trace_enabled as _trace_enabled
 from .utils import pad_to_world_size
 from .diag_logger import (
     log_memory,
-    log_tensor,
     log_attention_memory,
     log_ulysses_alltoall,
-    profile_start,
-    profile_end,
-    log_fsdp_shard_state,
 )
 
+# Built on first use. yunchang refuses to construct this until set_seq_parallel_pg
+# has run, and that happens in join_process_group, after this module is imported.
+_xfuser_optimized_attention = None
 
-xfuser_optimized_attention = make_ulysses_attention("TORCH_EFFICIENT", False)
+
+def _attention_op():
+    global _xfuser_optimized_attention
+    if _xfuser_optimized_attention is None:
+        _xfuser_optimized_attention = make_ulysses_attention("TORCH_EFFICIENT", False)
+    return _xfuser_optimized_attention
 _H3_TRACE_FORWARD_DONE = False
 _H3_ATTN_PROFILE_DONE = False
 _H3_FORWARD_COUNT = 0
@@ -150,7 +155,7 @@ def h3_ulysses_attention(self, x, rope_freqs=None, transformer_options={}):
         log_attention_memory(q, k, v, "pre_alltoall")
     # All-to-all communication for Ulysses
     log_ulysses_alltoall(tuple(q.shape), tuple(q.shape), "pre_attention")
-    out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True)
+    out = _attention_op()(q, k, v, self.heads, skip_reshape=True)
     phase_end = mark_phase()
     if trace_this_attention:
         h3_memory_snapshot("h3_attention_after_ulysses", local_rows=sequence_length)
