@@ -6,7 +6,7 @@ from pathlib import Path
 
 from minimax_h3_t4.runtime.checkpoint_budget import LazyCheckpoint
 from minimax_h3_t4.runtime.model_facts import LAST_ADMISSION_AVAILABLE_BYTES, align_frame_count, memory_facts, minimum_legal_sample
-from scripts.prepare_model_stage import build_plan, clone_comfy, refuse_or_plan_download
+from scripts.prepare_model_stage import build_plan, clone_comfy, protected_replacements, refuse_or_plan_download
 
 
 class _Tensor:
@@ -62,6 +62,15 @@ def test_plan_does_not_download_or_claim_admission(tmp_path: Path) -> None:
     assert report["video_inference_claimed"] is False
     assert report["model_stage_allowed"] is False
     assert report["weights_status"]["status"] == "MISSING"
+
+
+def test_pip_plan_refuses_a_transitive_torch_upgrade() -> None:
+    refused = protected_replacements(
+        [{"metadata": {"name": "torch", "version": "2.99.0"}}, {"metadata": {"name": "comfy-aimdo", "version": "0.6.0"}}],
+        {"torch": "2.11.0+cu130", "torchvision": "0.26.0+cu130", "torchaudio": "2.11.0+cu130", "ray": "2.60.0"},
+    )
+    assert any("torch" in item and "2.11.0+cu130" in item for item in refused)
+    assert not any("comfy-aimdo" in item for item in refused)
 
 
 def test_download_stays_off_without_explicit_confirmation(tmp_path: Path) -> None:

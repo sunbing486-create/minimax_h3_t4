@@ -159,6 +159,20 @@ def clone_comfy(dest: Path) -> dict[str, Any]:
     }
 
 
+def protected_replacements(planned: list[dict[str, Any]], before: dict[str, str | None]) -> list[str]:
+    """Refuse a pip plan that would change torch, vision, audio, or ray, including transitive installs."""
+
+    refused = []
+    for item in planned:
+        name = str(item.get("metadata", {}).get("name", "")).lower().replace("_", "-")
+        version = item.get("metadata", {}).get("version")
+        canonical = name.replace("-", "")
+        for protected in PROTECTED:
+            if canonical == protected.replace("-", "") and before.get(protected) not in {None, version}:
+                refused.append(f"{protected} {before.get(protected)} would become {version}")
+    return refused
+
+
 def install_model_deps() -> dict[str, Any]:
     """Install Comfy import dependencies. Never install or replace torch, vision, audio, or ray."""
 
@@ -175,14 +189,7 @@ def install_model_deps() -> dict[str, Any]:
     planned = []
     if report_path.is_file():
         planned = json.loads(report_path.read_text(encoding="utf-8")).get("install", [])
-    refused = []
-    for item in planned:
-        name = str(item.get("metadata", {}).get("name", "")).lower().replace("_", "-")
-        version = item.get("metadata", {}).get("version")
-        canonical = name.replace("-", "")
-        for protected in PROTECTED:
-            if canonical == protected.replace("-", "") and before[protected] not in {None, version}:
-                refused.append(f"{protected} {before[protected]} would become {version}")
+    refused = protected_replacements(planned, before)
     if dry.returncode != 0 or refused:
         return {
             "ok": False,

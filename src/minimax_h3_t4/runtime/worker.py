@@ -273,7 +273,11 @@ class H3T4Worker:
         if config is None:
             raise ValueError("Checkpoint is not a native ComfyUI MiniMax-H3 model")
         state_dict.release_materialized()
-        model = config.get_model(state_dict, "")
+        # Comfy allocates every Linear at construction unless aimdo is on.
+        # Kaggle's f481 audit did not have comfy_aimdo, so that path would
+        # reserve the full parameter storage. meta keeps the shapes and skips
+        # the physical allocation; FSDP materializes each shard afterwards.
+        model = config.get_model(state_dict, "", torch.device("meta"))
         from comfy.model_base import MiniMaxH3
 
         if not isinstance(model, MiniMaxH3):
