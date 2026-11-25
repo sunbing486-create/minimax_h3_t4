@@ -668,6 +668,11 @@ def load_from_full_model_state_dict(
         if full_tensor is None:
             _note_missing(report, param_name, strict)
             continue
+        if (not full_tensor.is_floating_point()) and sharded_meta_param.is_floating_point():
+            raise RuntimeError(
+                f"{param_name} is {full_tensor.dtype} checkpoint storage and the placeholder is {sharded_meta_param.dtype}; "
+                "refusing to expand integer data into a floating tensor"
+            )
         if not hasattr(sharded_meta_param, "device_mesh"):
             full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, sharded_meta_param.shape)
             full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
