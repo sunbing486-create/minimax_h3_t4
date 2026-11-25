@@ -78,6 +78,13 @@ def test_ray_worker_import_uses_runtime_env_not_driver_path(monkeypatch, tmp_pat
     assert found["checkpoint_dir_writable"] is True
 
 
+def test_worker_probe_covers_the_modules_load_unet_imports() -> None:
+    from minimax_h3_t4.loader_nodes import LOAD_WORKER_IMPORTS
+
+    for name in ("comfy.model_detection", "comfy.model_management", "comfy.model_patcher", "comfy.model_base", "comfy.utils", "folder_paths"):
+        assert name in LOAD_WORKER_IMPORTS
+
+
 def test_worker_import_failure_blocks_transfer_without_calling_it() -> None:
     from minimax_h3_t4.runtime.unet_load import worker_probe_blockers
     from scripts.run_unet_load_session import preflight_blockers

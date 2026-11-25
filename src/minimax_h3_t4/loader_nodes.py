@@ -159,6 +159,8 @@ LOAD_WORKER_IMPORTS = (
     "folder_paths",
     "comfy.model_detection",
     "comfy.model_management",
+    "comfy.model_patcher",
+    "comfy.model_base",
     "comfy.utils",
     "xfuser.core.distributed",
     "yunchang",
