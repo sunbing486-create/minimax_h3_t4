@@ -79,10 +79,8 @@ def counted_module(module: Any) -> Any:
 
 
 def _payload_bytes(parameter: Any) -> tuple[int, str, str]:
-    qdata = getattr(parameter, "_qdata", None)
-    if qdata is not None:
-        return int(qdata.nbytes), str(qdata.device), str(qdata.dtype)
-    return int(parameter.numel()) * int(parameter.element_size()), str(parameter.device), str(parameter.dtype)
+    data = _resident_data(parameter)
+    return int(data.nbytes), str(data.device), str(data.dtype)
 
 
 def summarize_module_storage(module: Any) -> dict[str, Any]:

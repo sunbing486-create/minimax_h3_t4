@@ -609,6 +609,29 @@ def _is_meta_storage(tensor: torch.Tensor | None) -> bool:
     return getattr(getattr(data, "device", None), "type", "meta") == "meta"
 
 
+def _rewrap_fsdp(local_tensor: torch.Tensor, sharded_meta_param: torch.Tensor) -> torch.Tensor:
+    """Put a real local shard back under the FSDP DTensor spec.
+
+    ``DTensor.from_local`` on a ConvRot INT8 ``QuantizedTensor`` dequantizes
+    through ``view_as``. The constructor keeps the quantized storage and gives
+    the pre-forward hook a mesh. A bare ``Parameter`` does not.
+    """
+
+    if not hasattr(sharded_meta_param, "device_mesh"):
+        return local_tensor
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+
+    old = sharded_meta_param._spec
+    meta = old.tensor_meta
+    spec = DTensorSpec(
+        old.mesh,
+        tuple(old.placements),
+        tensor_meta=TensorMeta(meta.shape, meta.stride, local_tensor.dtype),
+    )
+    return DTensor(local_tensor, spec, requires_grad=False)
+
+
 def _install_tensor(module: torch.nn.Module, leaf: str, tensor: torch.Tensor, *, is_buffer: bool) -> None:
     """Replace the parameter object. Copying into a meta tensor is a no-op."""
 
@@ -667,7 +690,12 @@ def load_from_full_model_state_dict(
                 quant_tensor = quant_tensor.cpu()
             elif getattr(getattr(quant_tensor, "_qdata", quant_tensor), "device", None) != device:
                 quant_tensor = quant_tensor.to(device)
-            _install_tensor(parent_module, leaf_name, quant_tensor, is_buffer=False)
+            _install_tensor(
+                parent_module,
+                leaf_name,
+                _rewrap_fsdp(quant_tensor, sharded_meta_param),
+                is_buffer=False,
+            )
             _note_installed(report, parent_module, leaf_name, is_buffer=False)
             if release_sd:
                 _release_quant_keys(full_sd, param_name)

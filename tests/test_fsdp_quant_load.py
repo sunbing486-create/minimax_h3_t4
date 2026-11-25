@@ -39,8 +39,8 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
     try:
         mesh = init_device_mesh("cpu", (world,))
         if rank == 0:
-            weight = torch.arange(32, dtype=torch.int8).reshape(4, 8)
-            plain = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
+            weight = torch.arange(1024, dtype=torch.int16).remainder(127).to(torch.int8).reshape(4, 256)
+            plain = torch.arange(1024, dtype=torch.bfloat16).reshape(4, 256)
             conf = json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}).encode()
             payload = {
                 "quant.weight": weight,
@@ -52,8 +52,8 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
             save_file(payload, path)
         dist.barrier()
         host = torch.nn.Module()
-        host.quant = mixed_precision_ops({}, torch.bfloat16).Linear(8, 4, bias=False, device=torch.device("cpu"))
-        host.plain = disable_weight_init.Linear(8, 4, bias=False, device=torch.device("meta"))
+        host.quant = mixed_precision_ops({}, torch.bfloat16).Linear(256, 4, bias=False, device=torch.device("cpu"))
+        host.plain = disable_weight_init.Linear(256, 4, bias=False, device=torch.device("meta"))
         register_absent_weight_parameters(host)
         host.to("meta")
         fully_shard(host.quant, mesh=mesh)
@@ -77,10 +77,14 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
             Path(out).write_text(json.dumps({"rank": rank, "error": type(exc).__name__, "message": str(exc)}), encoding="utf-8")
             return
         quant = host.quant.weight
-        qdata = getattr(quant, "_qdata", None)
+        quant_local = getattr(quant, "_local_tensor", quant)
+        qdata = getattr(quant_local, "_qdata", None)
         plain_local = getattr(host.plain.weight, "_local_tensor", host.plain.weight)
-        reference = torch.arange(32, dtype=torch.int8).reshape(4, 8)
-        plain_reference = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
+        activation = torch.ones(1, 256, dtype=torch.bfloat16)
+        plain_mro_before = [item.__name__ for item in type(host.plain.weight).mro()[:4]]
+        quant_mro_before = [item.__name__ for item in type(quant).mro()[:4]]
+        reference = torch.arange(1024, dtype=torch.int16).remainder(127).to(torch.int8).reshape(4, 256)
+        plain_reference = torch.arange(1024, dtype=torch.bfloat16).reshape(4, 256)
         expect_q = torch.tensor_split(reference, world, dim=0)[rank]
         expect_p = torch.tensor_split(plain_reference, world, dim=0)[rank]
         outer = torch.nn.Module()
@@ -88,6 +92,13 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
         check = bounded_weight_check(outer, path, rank=rank, world_size=world)
         wrong = bounded_weight_check(outer, path, rank=1 - rank, world_size=world)
         storage = summarize_module_storage(outer)
+        plain_forward = host.plain(activation).detach().float().flatten()[:4].tolist()
+        quant_forward = None
+        quant_forward_error = None
+        try:
+            quant_forward = host.quant(activation).detach().float().flatten()[:4].tolist()
+        except Exception as exc:
+            quant_forward_error = {"error_type": type(exc).__name__, "message": str(exc)[:400]}
         Path(out).write_text(
             json.dumps(
                 {
@@ -100,7 +111,13 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
                     "plain_device": str(plain_local.device),
                     "plain_dtype": str(plain_local.dtype),
                     "plain_match": bool(torch.equal(plain_local.detach().cpu(), expect_p)),
-                    "plain_type": type(host.plain.weight).__name__,
+                    "quant_type": type(quant).__name__,
+                    "plain_mro_before": plain_mro_before,
+                    "quant_mro_before": quant_mro_before,
+                    "plain_shape_before": list(plain_local.shape),
+                    "plain_forward": plain_forward,
+                    "quant_forward": quant_forward,
+                    "quant_forward_error": quant_forward_error,
                     "check_status": check["status"],
                     "compared": check["compared"],
                     "matched": check["matched"],
@@ -168,12 +185,19 @@ def test_two_rank_fsdp_replaces_meta_with_int8_shard(tmp_path: Path) -> None:
         assert row["plain_device"] == "cpu"
         assert row["plain_dtype"] == "torch.bfloat16"
         assert row["plain_match"] is True
+        assert row["quant_mro_before"][0] == "DTensor", row
+        assert row["plain_mro_before"][0] == "DTensor", row
+        assert row["plain_shape_before"] == [2, 256]
+        assert row["quant_forward_error"] is None, row
         assert row["compared"] >= 2
         assert row["matched"] == row["compared"]
         assert row["mismatched"] == 0
         assert any(sample.get("quantized") is True and sample.get("storage") == "quantized_qdata" for sample in row["samples"])
         assert row["integrity"] == "COMPLETE"
         assert row["wrong_integrity"] == "INCOMPLETE"
+    assert rows[0]["plain_forward"] == rows[1]["plain_forward"]
+    assert rows[0]["quant_forward"] == rows[1]["quant_forward"]
+    assert rows[0]["quant_forward"] is not None
 
 
 @pytest.mark.skipif(not COMFY.is_dir(), reason="pinned Comfy checkout is absent")
