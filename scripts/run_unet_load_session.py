@@ -11,6 +11,8 @@ import argparse
 import json
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,7 +25,8 @@ for entry in (ROOT, SRC):
 
 from minimax_h3_t4.model_catalog import inventory_local_models
 from minimax_h3_t4.runtime.checkpoint_budget import host_available_bytes
-from minimax_h3_t4.runtime.unet_load import UNET_SPEC, choose_weight_dir, required_files, run_unet_load_only
+from minimax_h3_t4.runtime.unet_load import UNET_SPEC, choose_weight_dir, required_files, run_unet_load_only, runtime_gate
+from scripts.bootstrap_actor_admission import apply_plan
 from scripts.prepare_model_stage import audit_imports, clone_comfy, install_model_deps
 from scripts.run_actor_session import seal_evidence, show_session_evidence
 
@@ -37,11 +40,84 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget-s", type=float, default=SESSION_BUDGET_S)
     parser.add_argument("--enable-transfer", action="store_true")
     parser.add_argument("--comfy-dir", default=os.environ.get("H3_T4_COMFY_DIR", "/tmp/ComfyUI-h3"))
+    parser.add_argument("--child", action="store_true")
+    parser.add_argument("--sleep-child", action="store_true")
     args = parser.parse_args(argv)
     evidence = Path(args.evidence_dir)
-    code = run_session(evidence, budget_s=args.budget_s, enable_transfer=args.enable_transfer, comfy_dir=Path(args.comfy_dir))
+    if args.sleep_child:
+        _sleep_child(evidence)
+        return 0
+    if args.child:
+        code = run_session(evidence, budget_s=args.budget_s, enable_transfer=args.enable_transfer, comfy_dir=Path(args.comfy_dir))
+        show_session_evidence(evidence)
+        return code
+    code = run_watchdog(evidence, budget_s=args.budget_s, enable_transfer=args.enable_transfer, comfy_dir=Path(args.comfy_dir), sleep_child=False)
     show_session_evidence(evidence)
     return code
+
+
+def run_watchdog(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy_dir: Path, sleep_child: bool = False, memory_reader=host_available_bytes) -> int:
+    """Kill the session process group when the deadline or low memory hits.
+
+    The child finally block does not run after SIGKILL. This parent writes the
+    zip and manifest after the kill.
+    """
+
+    evidence.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(Path(__file__).resolve()), "--evidence-dir", str(evidence), "--budget-s", str(budget_s), "--comfy-dir", str(comfy_dir)]
+    if enable_transfer:
+        command.append("--enable-transfer")
+    command.append("--sleep-child" if sleep_child else "--child")
+    process = subprocess.Popen(command, start_new_session=True)
+    deadline = time.monotonic() + budget_s
+    reason = None
+    while process.poll() is None:
+        available = memory_reader()
+        if time.monotonic() >= deadline:
+            reason = "DEADLINE"
+            break
+        if available < 2 * 1024**3:
+            reason = "STOP_LOW_MEMORY"
+            break
+        time.sleep(0.2)
+    if reason is not None:
+        _kill_group(process.pid)
+        process.wait(timeout=5)
+        state = _read_state(evidence)
+        state.update({
+            "status": reason,
+            "watchdog_killed": True,
+            "child_pid": process.pid,
+            "unet_loaded": False,
+            "weight_alignment": "unknown",
+            "video_inference_claimed": False,
+            "remaining_processes": _matching_processes(evidence),
+        })
+        _seal(evidence, state)
+        return 2
+    state = _read_state(evidence)
+    if state.get("bundle_status") != "SEALED":
+        _seal(evidence, state)
+    return int(process.returncode or 0)
+
+
+def _sleep_child(evidence: Path) -> None:
+    evidence.mkdir(parents=True, exist_ok=True)
+    grandchild = subprocess.Popen(["sleep", "60"])
+    _write(evidence / "grandchild.pid", {"pid": grandchild.pid})
+    _write(evidence / "session-status.json", {"status": "BLOCKED", "unet_loaded": False, "weight_alignment": "unknown"})
+    time.sleep(60)
+
+
+def _kill_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        return
 
 
 def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy_dir: Path) -> int:
@@ -69,8 +145,16 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
             return exit_code
         state["clone"] = clone_comfy(comfy_dir)
         state["install"] = install_model_deps()
+        state["actor_deps"] = apply_plan()
         state["audit"] = audit_imports(comfy_dir)
+        state["preflight"] = runtime_gate(cuda_count=_cuda_count(), available_bytes=host_available_bytes())
         _write(evidence / "session-status.json", state)
+        if state["preflight"]["ok"] is not True:
+            state["status"] = "STOP_PREFLIGHT"
+            state["reason"] = "; ".join(state["preflight"]["blockers"])
+            return exit_code
+        window = deadline - time.monotonic() - LOAD_RESERVE_S
+        state["required_bytes_per_second"] = None if window <= 0 else int(UNET_SPEC["bytes"]) / window
         destination = choose_weight_dir([Path("/tmp"), Path("/kaggle/tmp")], int(UNET_SPEC["bytes"]), shutil.disk_usage)
         state["weight_dir"] = None if destination is None else str(destination)
         if enable_transfer and destination is None:
@@ -128,6 +212,50 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
         state["snapshot"] = "final"
         _write(evidence / "session-status.json", state)
         _write(evidence.parent / f"{evidence.name}-manifest.json", state)
+
+
+def _read_state(evidence: Path) -> dict[str, object]:
+    path = evidence / "session-status.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _seal(evidence: Path, state: dict[str, object]) -> None:
+    state["snapshot"] = "final"
+    _write(evidence / "session-status.json", state)
+    try:
+        state["bundle"] = seal_evidence(evidence)
+        state["bundle_status"] = "SEALED"
+    except Exception as exc:
+        state["bundle_status"] = "FAILED"
+        state["bundle_error"] = {"error_type": type(exc).__name__, "message": str(exc)[:300]}
+    _write(evidence / "session-status.json", state)
+    _write(evidence.parent / f"{evidence.name}-manifest.json", state)
+
+
+def _matching_processes(evidence: Path) -> list[dict[str, object]]:
+    me = os.getpid()
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) in {me, os.getppid()}:
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if "H3T4Worker" in command or str(evidence) in command:
+            pid = int(entry.name)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            found.append({"pid": pid, "cmd": command[:160]})
+    return found
 
 
 def _cuda_count() -> int:

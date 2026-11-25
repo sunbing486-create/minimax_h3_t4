@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import threading
+
+import pytest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -29,12 +31,56 @@ class _Disk:
         self.free = free
 
 
+def test_required_download_rate_after_the_reserve() -> None:
+    assert round(20970379616 / 840) == 24964738
+
+
+def test_watchdog_kills_a_blocked_child_and_seals_evidence(tmp_path: Path) -> None:
+    from scripts.run_unet_load_session import run_watchdog
+
+    evidence = tmp_path / "h3-unet-load"
+    code = run_watchdog(evidence, budget_s=1.2, enable_transfer=False, comfy_dir=tmp_path / "unused", sleep_child=True)
+    assert code == 2
+    status = json.loads((evidence / "session-status.json").read_text(encoding="utf-8"))
+    assert status["watchdog_killed"] is True
+    assert status["status"] == "DEADLINE"
+    assert status["bundle_status"] == "SEALED"
+    grandchild = json.loads((evidence / "grandchild.pid").read_text(encoding="utf-8"))["pid"]
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild, 0)
+
+
+def test_watchdog_kills_when_memory_is_low(tmp_path: Path) -> None:
+    from scripts.run_unet_load_session import run_watchdog
+
+    evidence = tmp_path / "h3-unet-load"
+    code = run_watchdog(evidence, budget_s=30, enable_transfer=False, comfy_dir=tmp_path / "unused", sleep_child=True, memory_reader=lambda: 1)
+    assert code == 2
+    status = json.loads((evidence / "session-status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "STOP_LOW_MEMORY"
+    assert status["bundle_status"] == "SEALED"
+
+
+def test_runtime_gate_blocks_download_without_two_cuda_devices() -> None:
+    from minimax_h3_t4.runtime.unet_load import runtime_gate
+
+    gate = runtime_gate(cuda_count=0, available_bytes=30 * 1024**3)
+    assert gate["ok"] is False
+    assert gate["download"] is False
+    assert any("CUDA" in item for item in gate["blockers"])
+
+
 def test_unet_notebook_compiles_and_does_not_enable_transfer_by_default() -> None:
     notebook = json.loads(Path("deploy/kaggle_actor_admission/kaggle_unet_load.ipynb").read_text(encoding="utf-8"))
     source = "".join(next(cell for cell in notebook["cells"] if cell["cell_type"] == "code")["source"])
     ast.parse(source)
     compile(source, "<notebook>", "exec")
     assert 'os.environ.get("H3_T4_ENABLE_TRANSFER", "0")' in source
+    enabled = json.loads(Path("deploy/kaggle_actor_admission/kaggle_unet_load_enabled.ipynb").read_text(encoding="utf-8"))
+    enabled_source = "".join(next(cell for cell in enabled["cells"] if cell["cell_type"] == "code")["source"])
+    ast.parse(enabled_source)
+    compile(enabled_source, "<enabled>", "exec")
+    assert "ENABLE_TRANSFER = True" in enabled_source
 
 
 def test_unet_load_requires_only_the_official_unet_file() -> None:
