@@ -34,26 +34,33 @@ LOAD_MODULES = (
 
 
 def import_unet_load_entry() -> dict[str, Any]:
-    """Import the real load entry. A missing symbol is reported, not stubbed."""
+    """Import the same modules load_unet imports. Keep the original exception."""
 
     missing: list[str] = []
     imported: list[str] = []
     cpu_unavailable: list[dict[str, str]] = []
+    failures: list[dict[str, str]] = []
     for name in LOAD_MODULES:
         status = _import_module(name)
         if status["status"] == "imported":
             imported.append(name)
         elif status["status"] == "cpu_cuda_unavailable":
             cpu_unavailable.append(status)
-        else:
+        elif status["status"] == "missing_module":
             missing.append(name)
+            failures.append(status)
+        else:
+            failures.append(status)
     for module_name, attributes in COMFY_ATTRIBUTES:
         module_status = _import_module(module_name)
         if module_status["status"] != "imported":
             if module_status["status"] == "cpu_cuda_unavailable":
                 cpu_unavailable.append(module_status)
-            else:
+            elif module_status["status"] == "missing_module":
                 missing.append(module_name)
+                failures.append(module_status)
+            else:
+                failures.append(module_status)
             continue
         module = importlib.import_module(module_name)
         for attribute in attributes:
@@ -72,8 +79,9 @@ def import_unet_load_entry() -> dict[str, Any]:
     if not slope_callable:
         missing.append("minimax_h3_t4.runtime.schedule.time_shift_slope")
     return {
-        "ok": not missing and not cpu_unavailable,
+        "ok": not missing and not failures and not cpu_unavailable,
         "missing": missing,
+        "failures": failures,
         "imported": imported,
         "cpu_cuda_unavailable": cpu_unavailable,
         "time_shift_slope_callable": slope_callable,
@@ -84,17 +92,35 @@ def import_unet_load_entry() -> dict[str, Any]:
 
 def _import_module(name: str) -> dict[str, str]:
     try:
-        importlib.import_module(name)
+        module = importlib.import_module(name)
     except ModuleNotFoundError as exc:
-        return {"name": name, "status": "missing_module", "error_type": "ModuleNotFoundError", "message": str(exc)[:240]}
+        status = "missing_module" if _names_this_module(name, exc) else "dependency_error"
+        return _error(name, status, exc)
     except ImportError as exc:
-        return {"name": name, "status": "missing_module", "error_type": "ImportError", "message": str(exc)[:240]}
+        return _error(name, "dependency_error", exc)
     except (NotImplementedError, AssertionError) as exc:
         text = str(exc)
-        status = "cpu_cuda_unavailable" if ("CUDA" in text or "Accelerator" in text or "No Accelerators" in text) else "error"
-        return {"name": name, "status": status, "error_type": type(exc).__name__, "message": text[:240]}
+        status = "cpu_cuda_unavailable" if ("CUDA" in text or "Accelerator" in text or "No Accelerators" in text) else "dependency_error"
+        return _error(name, status, exc)
     except Exception as exc:
         text = str(exc)
-        status = "cpu_cuda_unavailable" if ("CUDA" in text or "cuda" in text) else "error"
-        return {"name": name, "status": status, "error_type": type(exc).__name__, "message": text[:240]}
-    return {"name": name, "status": "imported", "error_type": "", "message": ""}
+        status = "cpu_cuda_unavailable" if ("CUDA" in text or "cuda" in text or "No Accelerators" in text) else "dependency_error"
+        return _error(name, status, exc)
+    return {"name": name, "status": "imported", "error_type": "", "message": "", "file": getattr(module, "__file__", None), "cause_type": "", "cause_message": ""}
+
+
+def _names_this_module(name: str, exc: ModuleNotFoundError) -> bool:
+    text = str(exc)
+    return text in {f"No module named {name!r}", f"No module named '{name}'"} or text.startswith(f"No module named '{name}'")
+
+
+def _error(name: str, status: str, exc: BaseException) -> dict[str, str]:
+    cause = exc.__cause__ or exc.__context__
+    return {
+        "name": name,
+        "status": status,
+        "error_type": type(exc).__name__,
+        "message": str(exc)[:500],
+        "cause_type": "" if cause is None else type(cause).__name__,
+        "cause_message": "" if cause is None else str(cause)[:500],
+    }

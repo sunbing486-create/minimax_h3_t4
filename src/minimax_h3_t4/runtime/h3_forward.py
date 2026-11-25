@@ -32,8 +32,16 @@ from .diag_logger import (
     log_ulysses_alltoall,
 )
 
+# Built on first use. yunchang refuses to construct this until set_seq_parallel_pg
+# has run, and that happens in join_process_group, after this module is imported.
+_xfuser_optimized_attention = None
 
-xfuser_optimized_attention = make_ulysses_attention("TORCH_EFFICIENT", False)
+
+def _attention_op():
+    global _xfuser_optimized_attention
+    if _xfuser_optimized_attention is None:
+        _xfuser_optimized_attention = make_ulysses_attention("TORCH_EFFICIENT", False)
+    return _xfuser_optimized_attention
 _H3_TRACE_FORWARD_DONE = False
 _H3_ATTN_PROFILE_DONE = False
 _H3_FORWARD_COUNT = 0
@@ -147,7 +155,7 @@ def h3_ulysses_attention(self, x, rope_freqs=None, transformer_options={}):
         log_attention_memory(q, k, v, "pre_alltoall")
     # All-to-all communication for Ulysses
     log_ulysses_alltoall(tuple(q.shape), tuple(q.shape), "pre_attention")
-    out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True)
+    out = _attention_op()(q, k, v, self.heads, skip_reshape=True)
     phase_end = mark_phase()
     if trace_this_attention:
         h3_memory_snapshot("h3_attention_after_ulysses", local_rows=sequence_length)

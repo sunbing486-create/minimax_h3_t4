@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -109,7 +110,7 @@ raise ImportError("cannot import name 'time_shift_slope'")
         assert row["weight_alignment"] == "unknown"
 
 
-def test_missing_load_entry_blocks_transfer() -> None:
+def test_dependency_error_is_not_reported_as_a_missing_file() -> None:
     from minimax_h3_t4.runtime.unet_load import worker_probe_blockers
 
     blockers = worker_probe_blockers(
@@ -117,11 +118,78 @@ def test_missing_load_entry_blocks_transfer() -> None:
             "imports": [],
             "cuda_count": 2,
             "checkpoint_dir_writable": True,
-            "load_entry": {"ok": False, "missing": ["comfy.ldm.minimax.model.time_shift_slope"]},
+            "load_entry": {
+                "ok": False,
+                "missing": [],
+                "failures": [{
+                    "name": "minimax_h3_t4.runtime.h3_forward",
+                    "error_type": "AssertionError",
+                    "message": "use set_seq_parallel_pg() first",
+                }],
+            },
         }
     )
-    assert any("time_shift_slope" in item for item in blockers)
+    assert any("set_seq_parallel_pg" in item for item in blockers)
+    assert all("file missing" not in item for item in blockers)
     started = []
     result = {"started_transfer": False} if blockers else started.append("transfer")
     assert started == []
     assert result["started_transfer"] is False
+
+
+def test_unpacked_package_resolves_h3_forward_from_another_cwd(tmp_path: Path) -> None:
+    import ast
+
+    source = Path("/workspace/src/minimax_h3_t4/runtime/h3_forward.py").read_text(encoding="utf-8")
+    module = ast.parse(source)
+    calls = []
+    for node in module.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            if node.value.func.id == "make_ulysses_attention":
+                calls.append(node)
+    assert calls == []
+    worker = Path("/workspace/src/minimax_h3_t4/runtime/worker.py").read_text(encoding="utf-8")
+    assert "from .h3_forward import h3_ulysses_attention, h3_ulysses_forward" in worker
+
+    packed = tmp_path / "package.zip"
+    extract = tmp_path / "extract"
+    other = tmp_path / "other-cwd"
+    other.mkdir()
+    with zipfile.ZipFile(packed, "w") as archive:
+        root = Path("/workspace/src/minimax_h3_t4")
+        for path in root.rglob("*.py"):
+            archive.write(path, Path("minimax_h3_t4") / path.relative_to(root))
+    with zipfile.ZipFile(packed) as archive:
+        archive.extractall(extract)
+    assert (extract / "minimax_h3_t4" / "runtime" / "h3_forward.py").is_file()
+    script = r"""
+import importlib.util, json, os, sys
+os.chdir(sys.argv[1])
+sys.path[:0] = [sys.argv[2], sys.argv[3]]
+spec = importlib.util.find_spec("minimax_h3_t4.runtime.h3_forward")
+import comfy.options
+comfy.options.enable_args_parsing()
+sys.argv = [sys.argv[0], "--cpu"]
+from minimax_h3_t4.runtime.load_entry import import_unet_load_entry
+report = import_unet_load_entry()
+report["origin"] = None if spec is None or spec.origin is None else spec.origin
+print(json.dumps(report))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(other), str(extract), str(COMFY)],
+        cwd=str(other),
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": "", "PYTHONNOUSERSITE": "1"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert report["origin"] is not None
+    assert str(extract) in report["origin"]
+    assert "h3_forward.py" in report["origin"]
+    assert "minimax_h3_t4.runtime.h3_forward" not in report["missing"]
+    unavailable = [item for item in report["cpu_cuda_unavailable"] if item["name"] == "minimax_h3_t4.runtime.h3_forward"]
+    assert unavailable
+    assert "No Accelerators" in unavailable[0]["message"]
+    assert unavailable[0]["error_type"] == "NotImplementedError"

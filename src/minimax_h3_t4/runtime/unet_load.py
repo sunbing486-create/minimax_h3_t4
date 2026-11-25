@@ -244,8 +244,15 @@ def worker_probe_blockers(probe: dict[str, Any], *, require_cuda: int = 2) -> li
     entry = probe.get("load_entry")
     if isinstance(entry, dict):
         for name in entry.get("missing") or []:
-            blockers.append(f"load entry missing {name}")
-        if require_cuda == 2 and entry.get("ok") is not True:
+            blockers.append(f"load entry file missing {name}")
+        for item in entry.get("failures") or []:
+            if isinstance(item, dict):
+                blockers.append(f"load entry {item.get('name')} {item.get('error_type')}: {item.get('message')}")
+        if require_cuda == 2:
+            for item in entry.get("cpu_cuda_unavailable") or []:
+                if isinstance(item, dict):
+                    blockers.append(f"load entry {item.get('name')} {item.get('error_type')}: {item.get('message')}")
+        if require_cuda == 2 and entry.get("ok") is not True and not blockers:
             blockers.append("load entry import did not succeed inside the ray worker")
     return blockers
 
