@@ -67,27 +67,58 @@ def decide_unet_load(
     }
 
 
+def counted_module(module: Any) -> Any:
+    """ModelPatcher has no parameters. The loaded weights live on its model."""
+
+    if module is None:
+        return None
+    inner = getattr(module, "model", None)
+    if inner is not None and inner is not module and callable(getattr(inner, "parameters", None)):
+        return inner
+    return module
+
+
+def _payload_bytes(parameter: Any) -> tuple[int, str, str]:
+    qdata = getattr(parameter, "_qdata", None)
+    if qdata is not None:
+        return int(qdata.nbytes), str(qdata.device), str(qdata.dtype)
+    return int(parameter.numel()) * int(parameter.element_size()), str(parameter.device), str(parameter.dtype)
+
+
 def summarize_module_storage(module: Any) -> dict[str, Any]:
     logical = meta = materialized = 0
     devices: dict[str, int] = {}
     dtypes: dict[str, int] = {}
     count = 0
-    if module is None:
-        return {"parameter_count": 0, "logical_bytes": 0, "meta_bytes": 0, "materialized_bytes": 0, "bytes_by_device": {}, "bytes_by_dtype": {}}
-    parameters = getattr(module, "parameters", None)
+    uninitialized = 0
+    target = counted_module(module)
+    if target is None:
+        return {"parameter_count": 0, "logical_bytes": 0, "meta_bytes": 0, "materialized_bytes": 0, "bytes_by_device": {}, "bytes_by_dtype": {}, "uninitialized_weights": 0, "counted_type": None}
+    for child in target.modules():
+        shape = getattr(child, "_orig_shape", None)
+        if isinstance(shape, tuple) and getattr(child, "weight", None) is None:
+            uninitialized += 1
+    parameters = getattr(target, "parameters", None)
     if not callable(parameters):
-        return {"parameter_count": 0, "logical_bytes": 0, "meta_bytes": 0, "materialized_bytes": 0, "bytes_by_device": {}, "bytes_by_dtype": {}}
+        return {
+            "parameter_count": 0,
+            "logical_bytes": 0,
+            "meta_bytes": 0,
+            "materialized_bytes": 0,
+            "bytes_by_device": {},
+            "bytes_by_dtype": {},
+            "uninitialized_weights": uninitialized,
+            "counted_type": type(target).__name__,
+        }
     for parameter in parameters():
         if parameter is None:
             continue
         count += 1
-        nbytes = int(parameter.numel()) * int(parameter.element_size())
+        nbytes, device, dtype = _payload_bytes(parameter)
         logical += nbytes
-        device = str(parameter.device)
         devices[device] = devices.get(device, 0) + nbytes
-        dtype = str(parameter.dtype)
         dtypes[dtype] = dtypes.get(dtype, 0) + nbytes
-        if parameter.device.type == "meta":
+        if "meta" in device:
             meta += nbytes
         else:
             materialized += nbytes
@@ -98,7 +129,10 @@ def summarize_module_storage(module: Any) -> dict[str, Any]:
         "materialized_bytes": materialized,
         "bytes_by_device": devices,
         "bytes_by_dtype": dtypes,
+        "uninitialized_weights": uninitialized,
+        "counted_type": type(target).__name__,
         "meta_counts_as_loaded": False,
+        "quant_payload_counts_as_materialized": True,
     }
 
 
@@ -115,10 +149,12 @@ def bounded_weight_check(module: Any, path: str | None, *, limit: int = 64) -> d
         for name, parameter in module.named_parameters():
             if compared >= 3:
                 break
-            if parameter is None or parameter.device.type == "meta" or name not in names:
+            payload = getattr(parameter, "_qdata", None)
+            actual_tensor = parameter if payload is None else payload
+            if actual_tensor is None or actual_tensor.device.type == "meta" or name not in names:
                 continue
             reference = handle.get_tensor(name).flatten()[:limit]
-            actual = parameter.detach().flatten()[:limit].cpu()
+            actual = actual_tensor.detach().flatten()[:limit].cpu()
             compared += 1
             if reference.shape == actual.shape and reference.dtype == actual.dtype and bool((reference == actual).all()):
                 matched += 1
@@ -373,6 +409,8 @@ def _loaded(reports: list[dict[str, Any]]) -> bool:
     for report in reports:
         storage = report.get("storage") or {}
         if int(storage.get("materialized_bytes") or 0) <= 0:
+            return False
+        if int(storage.get("uninitialized_weights") or 0) > 0:
             return False
         if int(storage.get("meta_bytes") or 0) >= int(storage.get("logical_bytes") or 0):
             return False

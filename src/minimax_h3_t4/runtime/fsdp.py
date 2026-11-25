@@ -551,6 +551,36 @@ def _wrap_quantized_local_as_dtensor(
 # Heavily modified from
 # https://github.com/meta-pytorch/torchtune/blob/d0f63bb33d00b8bd3905a010b71d8c6324c2e980/torchtune/training/_distributed.py#L336
 # Need to be done since dcp loader cause wrong dtype among rank when broadcasting.
+def _note_missing(report: dict[str, Any], param_name: str, strict: bool) -> None:
+    report["missing"] += 1
+    names = report["missing_names"]
+    if len(names) < 20:
+        names.append(param_name)
+    if strict:
+        raise ValueError(f"Missing parameter {param_name} in state_dict")
+
+
+def register_absent_weight_parameters(model: torch.nn.Module) -> int:
+    """Give Comfy quantized layers a meta weight so the loader can see the key.
+
+    ``mixed_precision_ops.Linear`` leaves ``weight`` unset until
+    ``_load_from_state_dict``. ``state_dict()`` then omits the checkpoint key,
+    and the FSDP loader never reads it.
+    """
+
+    registered = 0
+    for module in model.modules():
+        shape = getattr(module, "_orig_shape", None)
+        if not isinstance(shape, tuple) or not shape:
+            continue
+        if getattr(module, "weight", None) is not None:
+            continue
+        dtype = getattr(module, "factory_kwargs", {}).get("dtype") or torch.float32
+        module.weight = torch.nn.Parameter(torch.empty(shape, device="meta", dtype=dtype), requires_grad=False)
+        registered += 1
+    return registered
+
+
 def load_from_full_model_state_dict(
     model,
     full_sd,
@@ -561,15 +591,17 @@ def load_from_full_model_state_dict(
 ):
     meta_sharded_sd = model.state_dict()
     sharded_sd: dict[str, torch.Tensor] = {}
+    report = {"requested": 0, "matched": 0, "missing": 0, "missing_names": []}
     for param_name, sharded_meta_param in meta_sharded_sd.items():
+        report["requested"] += 1
         parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
         is_buffer = leaf_name in parent_module._buffers
         if not is_buffer and _should_materialize_unsharded_param(param_name, sharded_meta_param, full_sd):
             full_tensor = full_sd.get(param_name)
             if full_tensor is None:
-                if strict:
-                    raise ValueError(f"Missing parameter {param_name} in state_dict")
+                _note_missing(report, param_name, strict)
                 continue
+            report["matched"] += 1
             _materialize_unsharded_param(model, param_name, sharded_meta_param, full_tensor, device, cpu_offload)
             if release_sd:
                 full_sd[param_name] = None
@@ -580,6 +612,7 @@ def load_from_full_model_state_dict(
             if quant_tensor is None:
                 debug_info = _quant_payload_debug_info(param_name, full_sd)
                 raise ValueError(f"Expected quantized tensor for {param_name}, but could not build it ({debug_info})")
+            report["matched"] += 1
             if hasattr(sharded_meta_param, "device_mesh"):
                 sharded_tensor = _wrap_quantized_local_as_dtensor(
                     quant_tensor,
@@ -595,9 +628,9 @@ def load_from_full_model_state_dict(
             continue
         full_tensor = full_sd.get(param_name)
         if full_tensor is None:
-            if strict:
-                raise ValueError(f"Missing parameter {param_name} in state_dict")
+            _note_missing(report, param_name, strict)
             continue
+        report["matched"] += 1
         if not hasattr(sharded_meta_param, "device_mesh"):
             full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, sharded_meta_param.shape)
             full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
@@ -617,4 +650,6 @@ def load_from_full_model_state_dict(
             full_sd[param_name] = None
     out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
     _materialize_missing_ignored_params(model, full_sd, device, strict, cpu_offload, release_sd)
-    return out
+    report["load_state_dict_missing"] = [str(key) for key in getattr(out, "missing_keys", [])[:20]]
+    report["load_state_dict_unexpected"] = [str(key) for key in getattr(out, "unexpected_keys", [])[:20]]
+    return report

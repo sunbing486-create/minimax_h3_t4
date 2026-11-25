@@ -331,7 +331,7 @@ class H3T4Worker:
         import comfy.utils
         import torch
 
-        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict
+        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict, register_absent_weight_parameters
         from .h3_forward import h3_ulysses_attention, h3_ulysses_forward
         from .int8 import install_int8_cuda_oom_retry
         from .ulysses import inject_minimax_h3_ulysses
@@ -408,6 +408,7 @@ class H3T4Worker:
         self.load_trace.append(sample_process_memory("before_shard"))
         log_host("before_fsdp_shard")
         diffusion = model.diffusion_model
+        self._registered_absent_weights = register_absent_weight_parameters(diffusion)
         diffusion.to("meta")
         fsdp_kwargs: dict[str, Any] = {"mesh": self.device_mesh, "reshard_after_forward": True}
         if cpu_offload:
@@ -420,7 +421,7 @@ class H3T4Worker:
             native_ignore_scale=False,
         )
         log_fsdp_shard_state(diffusion, "post_shard")
-        load_from_full_model_state_dict(
+        self._key_report = load_from_full_model_state_dict(
             diffusion,
             full_state,
             self.device,
@@ -468,12 +469,14 @@ class H3T4Worker:
         }
 
     def shard_report(self) -> dict[str, Any]:
-        from .unet_load import bounded_weight_check, sample_process_memory, summarize_module_storage
+        from .unet_load import bounded_weight_check, counted_module, sample_process_memory, summarize_module_storage
 
         storage = summarize_module_storage(self.model)
         return {
             "storage": storage,
-            "weight_check": bounded_weight_check(self.model, getattr(self, "_unet_path", None)),
+            "registered_absent_weights": getattr(self, "_registered_absent_weights", 0),
+            "key_report": getattr(self, "_key_report", None),
+            "weight_check": bounded_weight_check(counted_module(self.model), getattr(self, "_unet_path", None)),
             "process": sample_process_memory("shard_report"),
             "trace": list(getattr(self, "load_trace", [])),
             "loaded": storage["materialized_bytes"] > 0 and storage["meta_bytes"] < storage["logical_bytes"],
@@ -504,7 +507,7 @@ class H3T4Worker:
         import comfy.model_patcher
         import comfy.utils
 
-        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict
+        from .fsdp import fully_shard_bottom_up, load_from_full_model_state_dict, register_absent_weight_parameters
         from .h3_forward import h3_ulysses_attention, h3_ulysses_forward
         from .int8 import install_int8_cuda_oom_retry
         from .ulysses import inject_minimax_h3_ulysses
@@ -553,6 +556,7 @@ class H3T4Worker:
             "diffusion_model.",
         )
         diffusion = model.diffusion_model
+        self._registered_absent_weights = register_absent_weight_parameters(diffusion)
         diffusion.to("meta")
         fsdp_kwargs: dict[str, Any] = {"mesh": self.device_mesh, "reshard_after_forward": True}
         if cpu_offload:
@@ -564,7 +568,7 @@ class H3T4Worker:
             fsdp_kwargs=fsdp_kwargs,
             native_ignore_scale=False,
         )
-        load_from_full_model_state_dict(
+        self._key_report = load_from_full_model_state_dict(
             diffusion,
             full_state,
             self.device,
