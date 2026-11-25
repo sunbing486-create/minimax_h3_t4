@@ -22,7 +22,7 @@ from comfy.ops import disable_weight_init, mixed_precision_ops
 from safetensors.torch import save_file
 from minimax_h3_t4.runtime.checkpoint_budget import LazyCheckpoint
 from minimax_h3_t4.runtime.fsdp import load_from_full_model_state_dict, register_absent_weight_parameters
-from minimax_h3_t4.runtime.unet_load import load_integrity, summarize_module_storage
+from minimax_h3_t4.runtime.unet_load import bounded_weight_check, load_integrity, summarize_module_storage
 
 plain = disable_weight_init.Linear(8, 4, bias=False, device=torch.device("meta"))
 quant_ops = mixed_precision_ops({}, torch.bfloat16)
@@ -52,6 +52,9 @@ def getter(key):
 keys = ["quant.weight", "quant.weight_scale", "quant.comfy_quant", "quant.bias", "plain.weight"]
 report = load_from_full_model_state_dict(host, LazyCheckpoint(getter, keys), torch.device("cpu"), strict=False, cpu_offload=True)
 after = summarize_module_storage(patcher)
+outer = torch.nn.Module()
+outer.diffusion_model = host
+check = bounded_weight_check(outer, path, rank=0, world_size=1)
 qdata = quant.weight._qdata
 print(json.dumps({
     "patcher_parameters": callable(getattr(patcher, "parameters", None)),
@@ -65,7 +68,8 @@ print(json.dumps({
     "qdata": qdata.view(torch.int8).flatten().tolist(),
     "plain_sum": float(plain.weight.detach().sum()),
     "meta_bytes": after["meta_bytes"],
-    "integrity": load_integrity(after, {"status": "CHECKED", "compared": 2, "matched": 2}, report)["status"],
+    "integrity": load_integrity(after, check, report)["status"],
+    "check": check,
     "false_pass": load_integrity(
         {"materialized_bytes": 21794304, "meta_bytes": 80423927808, "uninitialized_weights": 0, "logical_bytes": 80445722112},
         {"status": "NOT_COMPARABLE", "compared": 0, "matched": 0},

@@ -90,6 +90,8 @@ def summarize_module_storage(module: Any) -> dict[str, Any]:
     devices: dict[str, int] = {}
     dtypes: dict[str, int] = {}
     count = 0
+    quantized_parameters = 0
+    qdata_bytes = 0
     uninitialized = 0
     target = counted_module(module)
     if target is None:
@@ -115,6 +117,9 @@ def summarize_module_storage(module: Any) -> dict[str, Any]:
             continue
         count += 1
         nbytes, device, dtype = _payload_bytes(parameter)
+        if getattr(parameter, "_qdata", None) is not None or getattr(getattr(parameter, "_local_tensor", None), "_qdata", None) is not None:
+            quantized_parameters += 1
+            qdata_bytes += nbytes
         logical += nbytes
         devices[device] = devices.get(device, 0) + nbytes
         dtypes[dtype] = dtypes.get(dtype, 0) + nbytes
@@ -124,6 +129,8 @@ def summarize_module_storage(module: Any) -> dict[str, Any]:
             materialized += nbytes
     return {
         "parameter_count": count,
+        "quantized_parameters": quantized_parameters,
+        "qdata_bytes": qdata_bytes,
         "logical_bytes": logical,
         "meta_bytes": meta,
         "materialized_bytes": materialized,
@@ -142,6 +149,15 @@ def _resident_data(parameter: Any) -> Any:
     return getattr(data, "_qdata", data)
 
 
+def _checkpoint_key(name: str, names: set[str]) -> str | None:
+    if name in names:
+        return name
+    for prefix in ("diffusion_model.", "model."):
+        if name.startswith(prefix) and name[len(prefix) :] in names:
+            return name[len(prefix) :]
+    return None
+
+
 def bounded_weight_check(module: Any, path: str | None, *, limit: int = 64, rank: int = 0, world_size: int = 1) -> dict[str, Any]:
     """Compare resident payload with the checkpoint slice. Meta tensors are not a match."""
 
@@ -150,32 +166,32 @@ def bounded_weight_check(module: Any, path: str | None, *, limit: int = 64, rank
     from safetensors import safe_open
 
     names = None
-    plain = quant = largest = None
+    plain = quant = None
     for name, parameter in module.named_parameters():
         data = _resident_data(parameter)
         if data is None or getattr(data.device, "type", "meta") == "meta":
             continue
         quantized = getattr(parameter, "_qdata", None) is not None or getattr(getattr(parameter, "_local_tensor", None), "_qdata", None) is not None
         item = (name, data, quantized)
-        if largest is None or int(data.nbytes) > int(largest[1].nbytes):
-            largest = item
-        if quantized and quant is None:
+        if quantized and (quant is None or int(data.nbytes) > int(quant[1].nbytes)):
             quant = item
-        if not quantized and data.ndim >= 2 and plain is None:
+        if not quantized and data.ndim >= 2 and (plain is None or int(data.nbytes) > int(plain[1].nbytes)):
             plain = item
     chosen = []
-    for item in (plain, quant, largest):
+    for item in (quant, plain):
         if item is not None and item not in chosen:
             chosen.append(item)
-    compared = matched = 0
+    compared = matched = mismatched = absent = 0
     samples = []
     with safe_open(path, framework="pt", device="cpu") as handle:
         names = set(handle.keys())
         for name, data, quantized in chosen:
-            if name not in names:
-                samples.append({"name": name, "matched": False, "reason": "key_absent"})
+            file_key = _checkpoint_key(name, names)
+            if file_key is None:
+                absent += 1
+                samples.append({"name": name, "quantized": quantized, "matched": False, "reason": "key_absent", "storage": "quantized_qdata" if quantized else "plain"})
                 continue
-            reference = handle.get_tensor(name)
+            reference = handle.get_tensor(file_key)
             import torch
 
             if world_size > 1 and reference.ndim > 0 and reference.shape[0] == data.shape[0] * world_size:
@@ -185,9 +201,19 @@ def bounded_weight_check(module: Any, path: str | None, *, limit: int = 64, rank
             compared += 1
             same = reference.shape == actual.shape and reference.dtype == actual.dtype and bool((reference == actual).all())
             matched += int(same)
-            samples.append({"name": name, "quantized": quantized, "matched": same, "nbytes": int(data.nbytes)})
+            mismatched += int(not same)
+            samples.append({
+                "name": name,
+                "checkpoint_key": file_key,
+                "quantized": quantized,
+                "storage": "quantized_qdata" if quantized else "plain",
+                "matched": same,
+                "dtype": str(actual.dtype),
+                "shape": list(data.shape),
+                "nbytes": int(data.nbytes),
+            })
     status = "CHECKED" if compared else "NOT_COMPARABLE"
-    return {"status": status, "compared": compared, "matched": matched, "samples": samples}
+    return {"status": status, "compared": compared, "matched": matched, "mismatched": mismatched, "absent": absent, "samples": samples}
 
 
 def load_integrity(storage: dict[str, Any], weight_check: dict[str, Any] | None, key_report: dict[str, Any] | None) -> dict[str, Any]:
@@ -206,8 +232,17 @@ def load_integrity(storage: dict[str, Any], weight_check: dict[str, Any] | None,
     if int(keys.get("missing") or 0) > 0:
         reasons.append("checkpoint keys were missing")
     check = weight_check or {}
-    if check.get("status") != "CHECKED" or int(check.get("matched") or 0) < 1:
-        reasons.append("checkpoint sample did not match a resident tensor")
+    samples = check.get("samples") or []
+    if int(check.get("absent") or 0) > 0 or any(item.get("reason") == "key_absent" for item in samples if isinstance(item, dict)):
+        reasons.append("sample key is absent from the checkpoint")
+    if int(check.get("mismatched") or 0) > 0:
+        reasons.append("checkpoint sample mismatch")
+    quant_matched = any(isinstance(item, dict) and item.get("quantized") is True and item.get("matched") is True for item in samples)
+    plain_matched = any(isinstance(item, dict) and item.get("quantized") is not True and item.get("matched") is True for item in samples)
+    if not quant_matched:
+        reasons.append("no quantized shard matched the checkpoint")
+    if not plain_matched:
+        reasons.append("no floating shard matched the checkpoint")
     return {"status": "COMPLETE" if not reasons else "INCOMPLETE", "reasons": reasons}
 
 

@@ -200,6 +200,12 @@ def _get_parent_module_and_name(model: torch.nn.Module, param_name: str) -> tupl
     return model.get_submodule(parent_name), leaf_name
 
 
+def _checkpoint_dtype(full_tensor: torch.Tensor, meta_param: torch.Tensor) -> torch.dtype:
+    if full_tensor.is_floating_point():
+        return full_tensor.dtype
+    return meta_param.dtype
+
+
 def _maybe_collapse_replicated_leading_dim(full_tensor: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     expected_shape = tuple(target_shape)
     if tuple(full_tensor.shape) == expected_shape:
@@ -234,9 +240,11 @@ def _materialize_unsharded_param(
     cpu_offload: bool,
 ) -> None:
     full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, meta_param.shape)
-    # When CPU offloading, load directly to CPU to avoid a transient GPU spike
+    # When CPU offloading, load directly to CPU to avoid a transient GPU spike.
+    # Keep the checkpoint floating dtype. The meta placeholder is often float32
+    # while the official UNet stores BF16 and F16.
     target_device = torch.device("cpu") if cpu_offload else device
-    full_tensor = full_tensor.to(dtype=meta_param.dtype, device=target_device)
+    full_tensor = full_tensor.to(dtype=_checkpoint_dtype(full_tensor, meta_param), device=target_device)
     parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
     parent_module.register_parameter(
         leaf_name,
@@ -675,10 +683,10 @@ def load_from_full_model_state_dict(
             )
         if not hasattr(sharded_meta_param, "device_mesh"):
             full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, sharded_meta_param.shape)
-            full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
+            full_tensor = full_tensor.to(dtype=_checkpoint_dtype(full_tensor, sharded_meta_param), device=device)
             sharded_tensor = full_tensor
         else:
-            full_tensor = full_tensor.to(sharded_meta_param.dtype)
+            full_tensor = full_tensor.to(dtype=_checkpoint_dtype(full_tensor, sharded_meta_param))
             local_dense = _shard_tensor(full_tensor, sharded_meta_param, device)
             sharded_tensor = DTensor.from_local(
                 local_dense,

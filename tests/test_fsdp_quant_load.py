@@ -33,13 +33,14 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
     from comfy.ops import disable_weight_init, mixed_precision_ops
     from minimax_h3_t4.runtime.checkpoint_budget import LazyCheckpoint
     from minimax_h3_t4.runtime.fsdp import load_from_full_model_state_dict, register_absent_weight_parameters
+    from minimax_h3_t4.runtime.unet_load import bounded_weight_check, load_integrity, summarize_module_storage
 
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         mesh = init_device_mesh("cpu", (world,))
         if rank == 0:
             weight = torch.arange(32, dtype=torch.int8).reshape(4, 8)
-            plain = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+            plain = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
             conf = json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}).encode()
             payload = {
                 "quant.weight": weight,
@@ -79,9 +80,14 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
         qdata = getattr(quant, "_qdata", None)
         plain_local = getattr(host.plain.weight, "_local_tensor", host.plain.weight)
         reference = torch.arange(32, dtype=torch.int8).reshape(4, 8)
-        plain_reference = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        plain_reference = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
         expect_q = torch.tensor_split(reference, world, dim=0)[rank]
         expect_p = torch.tensor_split(plain_reference, world, dim=0)[rank]
+        outer = torch.nn.Module()
+        outer.diffusion_model = host
+        check = bounded_weight_check(outer, path, rank=rank, world_size=world)
+        wrong = bounded_weight_check(outer, path, rank=1 - rank, world_size=world)
+        storage = summarize_module_storage(outer)
         Path(out).write_text(
             json.dumps(
                 {
@@ -92,8 +98,16 @@ def _rank_worker(rank: int, world: int, path: str, port: int, missing_scale: boo
                     "quant_dtype": str(qdata.dtype),
                     "quant_match": bool(torch.equal(qdata.view(torch.int8).cpu(), expect_q)),
                     "plain_device": str(plain_local.device),
+                    "plain_dtype": str(plain_local.dtype),
                     "plain_match": bool(torch.equal(plain_local.detach().cpu(), expect_p)),
                     "plain_type": type(host.plain.weight).__name__,
+                    "check_status": check["status"],
+                    "compared": check["compared"],
+                    "matched": check["matched"],
+                    "mismatched": check["mismatched"],
+                    "samples": check["samples"],
+                    "integrity": load_integrity(storage, check, report)["status"],
+                    "wrong_integrity": load_integrity(storage, wrong, report)["status"],
                 }
             ),
             encoding="utf-8",
@@ -152,7 +166,14 @@ def test_two_rank_fsdp_replaces_meta_with_int8_shard(tmp_path: Path) -> None:
         assert row["quant_dtype"] == "torch.int8"
         assert row["quant_match"] is True
         assert row["plain_device"] == "cpu"
+        assert row["plain_dtype"] == "torch.bfloat16"
         assert row["plain_match"] is True
+        assert row["compared"] >= 2
+        assert row["matched"] == row["compared"]
+        assert row["mismatched"] == 0
+        assert any(sample.get("quantized") is True and sample.get("storage") == "quantized_qdata" for sample in row["samples"])
+        assert row["integrity"] == "COMPLETE"
+        assert row["wrong_integrity"] == "INCOMPLETE"
 
 
 @pytest.mark.skipif(not COMFY.is_dir(), reason="pinned Comfy checkout is absent")
