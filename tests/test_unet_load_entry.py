@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 
 import pytest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,6 +60,39 @@ def test_watchdog_kills_when_memory_is_low(tmp_path: Path) -> None:
     status = json.loads((evidence / "session-status.json").read_text(encoding="utf-8"))
     assert status["status"] == "STOP_LOW_MEMORY"
     assert status["bundle_status"] == "SEALED"
+
+
+def test_expired_load_deadline_returns_before_workers(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "minimax_h3_t4.runtime.unet_load.decide_unet_load",
+        lambda **_kwargs: {"action": "RUN", "unet_loaded": False, "weight_alignment": "unknown"},
+    )
+    report = run_unet_load_only(unet_path=None, cuda_count=2, allow=True, available_bytes=30 * 1024**3, deadline=time.monotonic())
+    assert report["action"] == "STOP_BUDGET_BEFORE_LOAD"
+    assert report["unet_loaded"] is False
+
+
+def test_preflight_blocks_when_audit_or_cuda_is_not_ready() -> None:
+    from scripts.run_unet_load_session import preflight_blockers
+
+    blocked = preflight_blockers(
+        {"ok": True},
+        {"materials_ready_for_gpu_stage": True},
+        {"ok": False},
+        {"blockers": ["need 2 CUDA devices before any weight transfer, found 0"]},
+    )
+    assert any("audit" in item for item in blocked)
+    assert any("CUDA" in item for item in blocked)
+    ready = preflight_blockers({"ok": True}, {"materials_ready_for_gpu_stage": True}, {"ok": True}, {"blockers": []})
+    assert ready == []
+
+
+def test_cpu_import_gate_does_not_permit_a_download() -> None:
+    from minimax_h3_t4.runtime.unet_load import runtime_gate
+
+    gate = runtime_gate(cuda_count=0, available_bytes=30 * 1024**3)
+    assert gate["download"] is False
+    assert gate["ok"] is False
 
 
 def test_runtime_gate_blocks_download_without_two_cuda_devices() -> None:

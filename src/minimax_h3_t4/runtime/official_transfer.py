@@ -53,10 +53,20 @@ def transfer_file(
                 if elapsed >= 2 and written < expected_bytes:
                     rate = (written - existing) / max(elapsed, 0.001)
                     remaining = deadline - time.monotonic()
-                    if rate * remaining < (expected_bytes - written):
+                    left_bytes = expected_bytes - written
+                    required = left_bytes / remaining if remaining > 0 else left_bytes
+                    if remaining <= 0 or rate * remaining < left_bytes:
                         handle.flush()
                         os.fsync(handle.fileno())
-                        return {"ok": False, "action": "cancelled", "status": "TOO_SLOW", "started_transfer": True, "bytes": written, "bytes_per_second": rate}
+                        return {
+                            "ok": False,
+                            "action": "cancelled",
+                            "status": "TOO_SLOW",
+                            "started_transfer": True,
+                            "bytes": written,
+                            "bytes_per_second": rate,
+                            "required_bytes_per_second": required,
+                        }
                 if not chunk:
                     break
                 room = expected_bytes - written

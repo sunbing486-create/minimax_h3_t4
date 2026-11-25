@@ -26,7 +26,7 @@ for entry in (ROOT, SRC):
 from minimax_h3_t4.model_catalog import inventory_local_models
 from minimax_h3_t4.runtime.checkpoint_budget import host_available_bytes
 from minimax_h3_t4.runtime.unet_load import UNET_SPEC, choose_weight_dir, required_files, run_unet_load_only, runtime_gate
-from scripts.bootstrap_actor_admission import apply_plan
+from scripts.bootstrap_actor_admission import apply_plan, import_check
 from scripts.prepare_model_stage import audit_imports, clone_comfy, install_model_deps
 from scripts.run_actor_session import seal_evidence, show_session_evidence
 
@@ -82,7 +82,10 @@ def run_watchdog(evidence: Path, *, budget_s: float, enable_transfer: bool, comf
         time.sleep(0.2)
     if reason is not None:
         _kill_group(process.pid)
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, ChildProcessError):
+            process.kill()
         state = _read_state(evidence)
         state.update({
             "status": reason,
@@ -133,6 +136,7 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
         "inference_memory_proven": False,
         "actor_admission_passed": False,
         "model_stage_ready": False,
+        "weight_alignment": "unknown",
         "required_files": required_files(),
         "budget_s": budget_s,
         "snapshot": "pre-seal",
@@ -143,15 +147,21 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
         if time.monotonic() >= deadline:
             state["status"] = "NOT_RUN_BUDGET"
             return exit_code
+        _write(evidence / "session-status.json", state)
         state["clone"] = clone_comfy(comfy_dir)
+        _write(evidence / "session-status.json", state)
         state["install"] = install_model_deps()
+        _write(evidence / "session-status.json", state)
         state["actor_deps"] = apply_plan()
+        state["actor_imports"] = import_check()
         state["audit"] = audit_imports(comfy_dir)
         state["preflight"] = runtime_gate(cuda_count=_cuda_count(), available_bytes=host_available_bytes())
+        blockers = preflight_blockers(state["actor_deps"], state["actor_imports"], state["audit"], state["preflight"])
+        state["preflight_blockers"] = blockers
         _write(evidence / "session-status.json", state)
-        if state["preflight"]["ok"] is not True:
+        if blockers:
             state["status"] = "STOP_PREFLIGHT"
-            state["reason"] = "; ".join(state["preflight"]["blockers"])
+            state["reason"] = "; ".join(blockers)
             return exit_code
         window = deadline - time.monotonic() - LOAD_RESERVE_S
         state["required_bytes_per_second"] = None if window <= 0 else int(UNET_SPEC["bytes"]) / window
@@ -176,8 +186,13 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
             )
             state["started_transfer"] = state["transfer"].get("started_transfer") is True
             state["download"] = state["started_transfer"]
+            _write(evidence / "session-status.json", state)
             if state["transfer"].get("ok") is not True:
                 state["status"] = "STOP_TRANSFER"
+                return exit_code
+            if deadline - time.monotonic() < LOAD_RESERVE_S:
+                state["status"] = "STOP_BUDGET_BEFORE_LOAD"
+                state["reason"] = "transfer finished inside the load reserve; load was not started"
                 return exit_code
         else:
             state["transfer"] = {"ok": False, "started_transfer": False, "status": "NOT_ENABLED"}
@@ -189,6 +204,7 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
             cuda_count=_cuda_count(),
             allow=enable_transfer and unet.get("reusable") is True,
             available_bytes=host_available_bytes(),
+            deadline=deadline,
         )
         state["unet_loaded"] = state["load"].get("unet_loaded") is True
         state["status"] = "UNET_LOADED" if state["unet_loaded"] else "UNET_NOT_LOADED"
@@ -212,6 +228,22 @@ def run_session(evidence: Path, *, budget_s: float, enable_transfer: bool, comfy
         state["snapshot"] = "final"
         _write(evidence / "session-status.json", state)
         _write(evidence.parent / f"{evidence.name}-manifest.json", state)
+
+
+def preflight_blockers(actor_deps: dict[str, object], actor_imports: dict[str, object], audit: dict[str, object], gate: dict[str, object]) -> list[str]:
+    """Stop before any weight transfer when the real worker stack is not ready."""
+
+    blockers: list[str] = []
+    if actor_deps.get("ok") is not True:
+        blockers.append("xfuser/yunchang install did not succeed")
+    if actor_imports.get("materials_ready_for_gpu_stage") is not True:
+        blockers.append("worker pins are not xfuser==0.4.5 and yunchang==0.6.4")
+    if audit.get("ok") is not True:
+        blockers.append("comfy import audit is false")
+    extra = gate.get("blockers")
+    if isinstance(extra, list):
+        blockers.extend(str(item) for item in extra)
+    return blockers
 
 
 def _read_state(evidence: Path) -> dict[str, object]:

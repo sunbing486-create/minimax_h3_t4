@@ -417,6 +417,7 @@ class H3T4UNETLoader:
         manage_parent_memory: bool = True,
         interrupt_checker: Any | None = None,
         force_on_failure: bool = False,
+        timeout_seconds: float | None = None,
     ) -> tuple[H3T4ActorGroup]:
         actor_group.require_alive()
         if load_after is None:
@@ -426,7 +427,7 @@ class H3T4UNETLoader:
             _release_conditioning(self._model_management or _model_management())
         ray_module = actor_group.ray_module
         evidence = current_evidence()
-        timeout = env_seconds("H3_T4_MODEL_LOAD_TIMEOUT_S", 900)
+        timeout = env_seconds("H3_T4_MODEL_LOAD_TIMEOUT_S", 900) if timeout_seconds is None else timeout_seconds
         try:
             _require_smoke_before_weights()
             path = self._path_resolver(unet_name)

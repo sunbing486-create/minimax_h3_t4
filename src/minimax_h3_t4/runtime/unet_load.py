@@ -199,7 +199,15 @@ def _import_status(name: str) -> dict[str, Any]:
     return {"name": name, "status": "imported"}
 
 
-def run_unet_load_only(*, unet_path: str | None, cuda_count: int, allow: bool, available_bytes: int, evidence: Any | None = None) -> dict[str, Any]:
+def run_unet_load_only(
+    *,
+    unet_path: str | None,
+    cuda_count: int,
+    allow: bool,
+    available_bytes: int,
+    evidence: Any | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     reusable = False
     if unet_path:
         from .weights import inspect_local_weight
@@ -209,19 +217,35 @@ def run_unet_load_only(*, unet_path: str | None, cuda_count: int, allow: bool, a
     decision = decide_unet_load(unet_reusable=reusable, cuda_count=cuda_count, allow=allow, available_bytes=available_bytes)
     if decision["action"] != "RUN":
         return decision
+    load_timeout = None
+    if deadline is not None:
+        load_timeout = deadline - time.monotonic() - 20
+        if load_timeout <= 0:
+            decision["action"] = "STOP_BUDGET_BEFORE_LOAD"
+            decision["reason"] = "the remaining session time is inside the cleanup reserve"
+            return decision
     if evidence is not None:
-        evidence.event("unet_load_only_start", path=unet_path)
+        evidence.event("unet_load_only_start", path=unet_path, timeout_seconds=load_timeout)
     from ..loader_nodes import H3T4Initializer, H3T4UNETLoader
 
     group = None
     try:
         group = H3T4Initializer().initialize(load_after=object(), manage_parent_memory=False, for_admission=True, force_on_failure=True)[0]
-        group = H3T4UNETLoader(path_resolver=lambda _name: str(unet_path)).load(group, str(unet_path), object(), manage_parent_memory=False, force_on_failure=True)[0]
+        group = H3T4UNETLoader(path_resolver=lambda _name: str(unet_path)).load(
+            group,
+            str(unet_path),
+            object(),
+            manage_parent_memory=False,
+            force_on_failure=True,
+            timeout_seconds=load_timeout,
+        )[0]
         reports = []
-        for worker in group.workers:
-            from .lifecycle import remote, resolve
+        from .lifecycle import remote
+        from .startup import resolve_one
 
-            reports.append(resolve(group.ray_module, remote(worker, "shard_report")))
+        for worker in group.workers:
+            left = 20 if deadline is None else max(1.0, deadline - time.monotonic() - 20)
+            reports.append(resolve_one(group.ray_module, remote(worker, "shard_report"), left, label="shard_report"))
         decision.update({
             "action": "LOADED",
             "unet_loaded": _loaded(reports),
