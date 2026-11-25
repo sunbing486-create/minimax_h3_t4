@@ -22,7 +22,7 @@ from comfy.ops import disable_weight_init, mixed_precision_ops
 from safetensors.torch import save_file
 from minimax_h3_t4.runtime.checkpoint_budget import LazyCheckpoint
 from minimax_h3_t4.runtime.fsdp import load_from_full_model_state_dict, register_absent_weight_parameters
-from minimax_h3_t4.runtime.unet_load import summarize_module_storage
+from minimax_h3_t4.runtime.unet_load import load_integrity, summarize_module_storage
 
 plain = disable_weight_init.Linear(8, 4, bias=False, device=torch.device("meta"))
 quant_ops = mixed_precision_ops({}, torch.bfloat16)
@@ -64,6 +64,13 @@ print(json.dumps({
     "counted_type": after["counted_type"],
     "qdata": qdata.view(torch.int8).flatten().tolist(),
     "plain_sum": float(plain.weight.detach().sum()),
+    "meta_bytes": after["meta_bytes"],
+    "integrity": load_integrity(after, {"status": "CHECKED", "compared": 2, "matched": 2}, report)["status"],
+    "false_pass": load_integrity(
+        {"materialized_bytes": 21794304, "meta_bytes": 80423927808, "uninitialized_weights": 0, "logical_bytes": 80445722112},
+        {"status": "NOT_COMPARABLE", "compared": 0, "matched": 0},
+        {"matched": 532, "missing": 0, "still_meta": 264, "requested": 532},
+    )["status"],
 }))
 """
     completed = subprocess.run(
@@ -86,3 +93,47 @@ print(json.dumps({
     assert report["counted_type"] != "ModelPatcher"
     assert report["qdata"] == list(range(32))
     assert report["plain_sum"] == float(sum(range(32)))
+    assert report["meta_bytes"] == 0
+    assert report["integrity"] == "COMPLETE"
+    assert report["false_pass"] == "INCOMPLETE"
+
+
+def test_missing_quant_scale_is_rejected() -> None:
+    script = r"""
+import json, sys
+comfy_root, src_root, weight_path = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path[:0] = [comfy_root, src_root]
+import comfy.options
+comfy.options.enable_args_parsing()
+sys.argv = [sys.argv[0], "--cpu"]
+import torch
+from comfy.ops import mixed_precision_ops
+from safetensors.torch import save_file
+from minimax_h3_t4.runtime.checkpoint_budget import LazyCheckpoint
+from minimax_h3_t4.runtime.fsdp import load_from_full_model_state_dict, register_absent_weight_parameters
+ops = mixed_precision_ops({}, torch.bfloat16)
+quant = ops.Linear(8, 4, bias=False, device=torch.device("cpu"))
+register_absent_weight_parameters(quant)
+weight = torch.arange(32, dtype=torch.int8).reshape(4, 8)
+conf = json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}).encode()
+save_file({"weight": weight, "comfy_quant": torch.tensor(list(conf), dtype=torch.uint8)}, weight_path)
+
+def getter(key):
+    from safetensors import safe_open
+    with safe_open(weight_path, framework="pt", device="cpu") as handle:
+        return handle.get_tensor(key)
+try:
+    load_from_full_model_state_dict(quant, LazyCheckpoint(getter, ["weight", "comfy_quant"]), torch.device("cpu"), strict=True)
+except ValueError as exc:
+    print(type(exc).__name__)
+    raise SystemExit(0)
+raise SystemExit(2)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(COMFY), "/workspace/src", "/tmp/h3-missing-scale.safetensors"],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr + completed.stdout

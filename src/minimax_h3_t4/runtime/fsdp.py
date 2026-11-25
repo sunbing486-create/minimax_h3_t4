@@ -581,6 +581,50 @@ def register_absent_weight_parameters(model: torch.nn.Module) -> int:
     return registered
 
 
+def _stored_tensor(module: torch.nn.Module, leaf: str, *, is_buffer: bool) -> torch.Tensor | None:
+    if is_buffer:
+        return module.get_buffer(leaf)
+    if leaf not in module._parameters:
+        return None
+    return module.get_parameter(leaf)
+
+
+def _is_meta_storage(tensor: torch.Tensor | None) -> bool:
+    if tensor is None:
+        return True
+    data = getattr(tensor, "_local_tensor", None)
+    if data is None:
+        data = tensor
+    qdata = getattr(data, "_qdata", None)
+    if qdata is not None:
+        data = qdata
+    return getattr(getattr(data, "device", None), "type", "meta") == "meta"
+
+
+def _install_tensor(module: torch.nn.Module, leaf: str, tensor: torch.Tensor, *, is_buffer: bool) -> None:
+    """Replace the parameter object. Copying into a meta tensor is a no-op."""
+
+    if is_buffer:
+        value = tensor.detach() if isinstance(tensor, torch.nn.Parameter) else tensor
+        module.register_buffer(leaf, value)
+    else:
+        parameter = tensor if isinstance(tensor, torch.nn.Parameter) else torch.nn.Parameter(tensor, requires_grad=False)
+        module.register_parameter(leaf, parameter)
+
+
+def _note_installed(report: dict[str, Any], module: torch.nn.Module, leaf: str, *, is_buffer: bool) -> None:
+    stored = _stored_tensor(module, leaf, is_buffer=is_buffer)
+    report.setdefault("resident", 0)
+    report.setdefault("still_meta", 0)
+    report.setdefault("still_meta_names", [])
+    if _is_meta_storage(stored):
+        report["still_meta"] += 1
+        if len(report["still_meta_names"]) < 20:
+            report["still_meta_names"].append(leaf)
+        return
+    report["resident"] += 1
+
+
 def load_from_full_model_state_dict(
     model,
     full_sd,
@@ -590,8 +634,7 @@ def load_from_full_model_state_dict(
     release_sd=True,
 ):
     meta_sharded_sd = model.state_dict()
-    sharded_sd: dict[str, torch.Tensor] = {}
-    report = {"requested": 0, "matched": 0, "missing": 0, "missing_names": []}
+    report = {"requested": 0, "matched": 0, "missing": 0, "missing_names": [], "resident": 0, "still_meta": 0, "still_meta_names": []}
     for param_name, sharded_meta_param in meta_sharded_sd.items():
         report["requested"] += 1
         parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
@@ -601,8 +644,8 @@ def load_from_full_model_state_dict(
             if full_tensor is None:
                 _note_missing(report, param_name, strict)
                 continue
-            report["matched"] += 1
             _materialize_unsharded_param(model, param_name, sharded_meta_param, full_tensor, device, cpu_offload)
+            _note_installed(report, parent_module, leaf_name, is_buffer=False)
             if release_sd:
                 full_sd[param_name] = None
             continue
@@ -612,17 +655,12 @@ def load_from_full_model_state_dict(
             if quant_tensor is None:
                 debug_info = _quant_payload_debug_info(param_name, full_sd)
                 raise ValueError(f"Expected quantized tensor for {param_name}, but could not build it ({debug_info})")
-            report["matched"] += 1
-            if hasattr(sharded_meta_param, "device_mesh"):
-                sharded_tensor = _wrap_quantized_local_as_dtensor(
-                    quant_tensor,
-                    sharded_meta_param,
-                )
-            else:
-                sharded_tensor = quant_tensor
             if cpu_offload:
-                sharded_tensor = sharded_tensor.cpu()
-            sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+                quant_tensor = quant_tensor.cpu()
+            elif getattr(getattr(quant_tensor, "_qdata", quant_tensor), "device", None) != device:
+                quant_tensor = quant_tensor.to(device)
+            _install_tensor(parent_module, leaf_name, quant_tensor, is_buffer=False)
+            _note_installed(report, parent_module, leaf_name, is_buffer=False)
             if release_sd:
                 _release_quant_keys(full_sd, param_name)
             continue
@@ -630,7 +668,6 @@ def load_from_full_model_state_dict(
         if full_tensor is None:
             _note_missing(report, param_name, strict)
             continue
-        report["matched"] += 1
         if not hasattr(sharded_meta_param, "device_mesh"):
             full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, sharded_meta_param.shape)
             full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
@@ -645,11 +682,12 @@ def load_from_full_model_state_dict(
             )
         if cpu_offload:
             sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[param_name] = sharded_tensor if is_buffer else torch.nn.Parameter(sharded_tensor)
+        _install_tensor(parent_module, leaf_name, sharded_tensor, is_buffer=is_buffer)
+        _note_installed(report, parent_module, leaf_name, is_buffer=is_buffer)
         if release_sd:
             full_sd[param_name] = None
-    out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
     _materialize_missing_ignored_params(model, full_sd, device, strict, cpu_offload, release_sd)
-    report["load_state_dict_missing"] = [str(key) for key in getattr(out, "missing_keys", [])[:20]]
-    report["load_state_dict_unexpected"] = [str(key) for key in getattr(out, "unexpected_keys", [])[:20]]
+    report["load_state_dict_missing"] = []
+    report["load_state_dict_unexpected"] = []
+    report["matched"] = report["resident"]
     return report

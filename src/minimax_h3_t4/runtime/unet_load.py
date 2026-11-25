@@ -136,29 +136,79 @@ def summarize_module_storage(module: Any) -> dict[str, Any]:
     }
 
 
-def bounded_weight_check(module: Any, path: str | None, *, limit: int = 64) -> dict[str, Any]:
-    """Compare a few materialized values with the checkpoint. Meta tensors are not a match."""
+def _resident_data(parameter: Any) -> Any:
+    local = getattr(parameter, "_local_tensor", None)
+    data = parameter if local is None else local
+    return getattr(data, "_qdata", data)
+
+
+def bounded_weight_check(module: Any, path: str | None, *, limit: int = 64, rank: int = 0, world_size: int = 1) -> dict[str, Any]:
+    """Compare resident payload with the checkpoint slice. Meta tensors are not a match."""
 
     if not path or module is None or not callable(getattr(module, "named_parameters", None)):
-        return {"status": "NOT_CHECKED", "compared": 0}
+        return {"status": "NOT_CHECKED", "compared": 0, "matched": 0}
     from safetensors import safe_open
 
+    names = None
+    plain = quant = largest = None
+    for name, parameter in module.named_parameters():
+        data = _resident_data(parameter)
+        if data is None or getattr(data.device, "type", "meta") == "meta":
+            continue
+        quantized = getattr(parameter, "_qdata", None) is not None or getattr(getattr(parameter, "_local_tensor", None), "_qdata", None) is not None
+        item = (name, data, quantized)
+        if largest is None or int(data.nbytes) > int(largest[1].nbytes):
+            largest = item
+        if quantized and quant is None:
+            quant = item
+        if not quantized and data.ndim >= 2 and plain is None:
+            plain = item
+    chosen = []
+    for item in (plain, quant, largest):
+        if item is not None and item not in chosen:
+            chosen.append(item)
     compared = matched = 0
+    samples = []
     with safe_open(path, framework="pt", device="cpu") as handle:
         names = set(handle.keys())
-        for name, parameter in module.named_parameters():
-            if compared >= 3:
-                break
-            payload = getattr(parameter, "_qdata", None)
-            actual_tensor = parameter if payload is None else payload
-            if actual_tensor is None or actual_tensor.device.type == "meta" or name not in names:
+        for name, data, quantized in chosen:
+            if name not in names:
+                samples.append({"name": name, "matched": False, "reason": "key_absent"})
                 continue
-            reference = handle.get_tensor(name).flatten()[:limit]
-            actual = actual_tensor.detach().flatten()[:limit].cpu()
+            reference = handle.get_tensor(name)
+            import torch
+
+            if world_size > 1 and reference.ndim > 0 and reference.shape[0] == data.shape[0] * world_size:
+                reference = torch.tensor_split(reference, world_size, dim=0)[rank]
+            reference = reference.flatten()[:limit]
+            actual = data.detach().flatten()[:limit].cpu()
             compared += 1
-            if reference.shape == actual.shape and reference.dtype == actual.dtype and bool((reference == actual).all()):
-                matched += 1
-    return {"status": "CHECKED" if compared else "NOT_COMPARABLE", "compared": compared, "matched": matched}
+            same = reference.shape == actual.shape and reference.dtype == actual.dtype and bool((reference == actual).all())
+            matched += int(same)
+            samples.append({"name": name, "quantized": quantized, "matched": same, "nbytes": int(data.nbytes)})
+    status = "CHECKED" if compared else "NOT_COMPARABLE"
+    return {"status": status, "compared": compared, "matched": matched, "samples": samples}
+
+
+def load_integrity(storage: dict[str, Any], weight_check: dict[str, Any] | None, key_report: dict[str, Any] | None) -> dict[str, Any]:
+    """A nonzero byte count is not a loaded model while meta weights remain."""
+
+    reasons = []
+    if int((storage or {}).get("meta_bytes") or 0) > 0:
+        reasons.append("parameters remain on meta")
+    if int((storage or {}).get("uninitialized_weights") or 0) > 0:
+        reasons.append("quant weight is still unset")
+    if int((storage or {}).get("materialized_bytes") or 0) <= 0:
+        reasons.append("no resident payload")
+    keys = key_report or {}
+    if int(keys.get("still_meta") or 0) > 0:
+        reasons.append("assign left parameters on meta")
+    if int(keys.get("missing") or 0) > 0:
+        reasons.append("checkpoint keys were missing")
+    check = weight_check or {}
+    if check.get("status") != "CHECKED" or int(check.get("matched") or 0) < 1:
+        reasons.append("checkpoint sample did not match a resident tensor")
+    return {"status": "COMPLETE" if not reasons else "INCOMPLETE", "reasons": reasons}
 
 
 def persist_process_sample(evidence_dir: str | None, label: str, *, rank: int | None = None) -> dict[str, Any]:
@@ -406,15 +456,7 @@ def _worker_diagnostics(group: Any) -> list[dict[str, Any]]:
 def _loaded(reports: list[dict[str, Any]]) -> bool:
     if len(reports) != 2:
         return False
-    for report in reports:
-        storage = report.get("storage") or {}
-        if int(storage.get("materialized_bytes") or 0) <= 0:
-            return False
-        if int(storage.get("uninitialized_weights") or 0) > 0:
-            return False
-        if int(storage.get("meta_bytes") or 0) >= int(storage.get("logical_bytes") or 0):
-            return False
-    return True
+    return all((report.get("integrity") or {}).get("status") == "COMPLETE" for report in reports)
 
 
 def _gpus() -> list[dict[str, str]] | None:

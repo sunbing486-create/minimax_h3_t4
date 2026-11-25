@@ -469,14 +469,17 @@ class H3T4Worker:
         }
 
     def shard_report(self) -> dict[str, Any]:
-        from .unet_load import bounded_weight_check, counted_module, sample_process_memory, summarize_module_storage
+        from .unet_load import bounded_weight_check, counted_module, load_integrity, sample_process_memory, summarize_module_storage
 
         storage = summarize_module_storage(self.model)
+        key_report = getattr(self, "_key_report", None)
+        weight_check = bounded_weight_check(counted_module(self.model), getattr(self, "_unet_path", None), rank=self.rank, world_size=2)
         return {
             "storage": storage,
             "registered_absent_weights": getattr(self, "_registered_absent_weights", 0),
-            "key_report": getattr(self, "_key_report", None),
-            "weight_check": bounded_weight_check(counted_module(self.model), getattr(self, "_unet_path", None)),
+            "key_report": key_report,
+            "weight_check": weight_check,
+            "integrity": load_integrity(storage, weight_check, key_report),
             "process": sample_process_memory("shard_report"),
             "trace": list(getattr(self, "load_trace", [])),
             "loaded": storage["materialized_bytes"] > 0 and storage["meta_bytes"] < storage["logical_bytes"],
