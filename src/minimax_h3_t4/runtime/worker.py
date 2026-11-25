@@ -97,6 +97,83 @@ def _patch_psutil() -> None:
     psutil.virtual_memory = virtual_memory
 
 
+def worker_import_snapshot(module_names: list[str], checkpoint_dir: str, checkpoint_file: str | None = None) -> dict[str, Any]:
+    """Run inside a Ray worker. Report imports from that process only."""
+
+    import importlib
+    import importlib.metadata as metadata
+
+    rows = []
+    for name in module_names:
+        try:
+            module = importlib.import_module(name)
+        except ModuleNotFoundError as exc:
+            rows.append({"name": name, "status": "missing_module", "error_type": "ModuleNotFoundError", "message": str(exc), "file": None})
+            continue
+        except (AssertionError, NotImplementedError) as exc:
+            text = str(exc)
+            status = "cpu_cuda_unavailable" if ("CUDA" in text or "Accelerator" in text or "No Accelerators" in text) else "error"
+            rows.append({"name": name, "status": status, "error_type": type(exc).__name__, "message": text[:240], "file": None})
+            continue
+        except Exception as exc:
+            text = str(exc)
+            status = "cpu_cuda_unavailable" if ("CUDA" in text or "cuda" in text) else "error"
+            rows.append({"name": name, "status": status, "error_type": type(exc).__name__, "message": text[:240], "file": None})
+            continue
+        rows.append({"name": name, "status": "imported", "file": getattr(module, "__file__", None)})
+    versions = {}
+    for dist_name in ("torch", "torchvision", "torchaudio", "ray", "xfuser", "yunchang"):
+        try:
+            versions[dist_name] = metadata.version(dist_name)
+        except metadata.PackageNotFoundError:
+            versions[dist_name] = None
+    cuda_count = 0
+    try:
+        import torch
+
+        cuda_count = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        cuda_count = 0
+    directory = Path(checkpoint_dir)
+    writable = False
+    write_error = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / ".h3-worker-path-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        writable = True
+    except OSError as exc:
+        write_error = f"{type(exc).__name__}: {exc}"
+    readable = None
+    checkpoint_bytes = None
+    if checkpoint_file:
+        target = Path(checkpoint_file)
+        try:
+            checkpoint_bytes = target.stat().st_size
+            with target.open("rb") as handle:
+                handle.read(8)
+            readable = True
+        except OSError as exc:
+            readable = False
+            write_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "pythonpath": os.environ.get("PYTHONPATH"),
+        "imports": rows,
+        "versions": versions,
+        "cuda_count": cuda_count,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "checkpoint_dir": str(directory),
+        "checkpoint_dir_writable": writable,
+        "checkpoint_readable": readable,
+        "checkpoint_bytes": checkpoint_bytes,
+        "path_error": write_error,
+        "weight_alignment": "unknown",
+    }
+
+
 def _materialize_checkpoint_key(path: str, key: str) -> Any:
     from safetensors import safe_open
 
@@ -221,6 +298,20 @@ class H3T4Worker:
         )
 
     def load_unet(self, path: str, weight_dtype: str) -> bool:
+        self._last_load_error = None
+        from .unet_load import sample_process_memory
+
+        self.load_trace.append(sample_process_memory("load_unet_enter"))
+        self._rank_log(f"load_unet_enter pid={os.getpid()} cvd={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+        try:
+            return self._load_unet_impl(path, weight_dtype)
+        except BaseException as exc:
+            self._last_load_error = {"error_type": type(exc).__name__, "message": str(exc)[:500]}
+            self.load_trace.append(sample_process_memory("load_unet_failed"))
+            self._rank_log(f"load_unet_failed {type(exc).__name__}: {exc}")
+            raise
+
+    def _load_unet_impl(self, path: str, weight_dtype: str) -> bool:
         if not self.distributed_ready:
             raise RuntimeError("join_process_group must succeed before loading weights")
         if weight_dtype != "int8":
@@ -344,6 +435,28 @@ class H3T4Worker:
         self._unet_path = path
         self.load_trace.append(sample_process_memory("load_complete"))
         return True
+
+    def load_diagnostics(self) -> dict[str, Any]:
+        """Return samples already taken. This does not invent a GPU peak."""
+
+        trace = list(getattr(self, "load_trace", []))
+        used = []
+        for row in trace:
+            for gpu in row.get("gpus") or []:
+                text = str(gpu.get("memory_used_mib", "")).strip()
+                if text.isdigit():
+                    used.append(int(text))
+        return {
+            "rank": self.rank,
+            "pid": os.getpid(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "trace": trace,
+            "error": getattr(self, "_last_load_error", None),
+            "sampled_max_gpu_memory_used_mib": max(used) if used else None,
+            "sampled_max_is_not_a_continuous_profiler_peak": True,
+            "logical_bytes_are_not_a_measured_peak": True,
+            "weight_alignment": "unknown",
+        }
 
     def shard_report(self) -> dict[str, Any]:
         from .unet_load import bounded_weight_check, sample_process_memory, summarize_module_storage

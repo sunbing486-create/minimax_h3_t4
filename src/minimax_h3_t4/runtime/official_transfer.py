@@ -80,14 +80,34 @@ def transfer_file(
             os.fsync(handle.fileno())
     except Exception as exc:
         return {"ok": False, "action": "failed", "status": "HTTP_ERROR", "error_type": type(exc).__name__, "message": str(exc)[:300], "started_transfer": True, "bytes": written}
+    download_elapsed_s = round(time.monotonic() - started, 3)
+    bytes_per_second = None if download_elapsed_s <= 0 else (written - existing) / download_elapsed_s
     if written != expected_bytes:
-        return {"ok": False, "action": "failed", "status": "SHORT_FILE", "started_transfer": True, "bytes": written, "expected_bytes": expected_bytes}
+        return {
+            "ok": False,
+            "action": "failed",
+            "status": "SHORT_FILE",
+            "started_transfer": True,
+            "bytes": written,
+            "expected_bytes": expected_bytes,
+            "bytes_per_second": bytes_per_second,
+            "download_elapsed_s": download_elapsed_s,
+        }
     digest = _sha256(partial)
     if digest != expected_sha256:
         partial.unlink(missing_ok=True)
         return {"ok": False, "action": "failed", "status": "HASH_MISMATCH", "started_transfer": True, "sha256": digest}
     os.replace(partial, dest)
-    return {"ok": True, "action": "transferred", "path": str(dest), "bytes": written, "sha256": digest, "started_transfer": True}
+    return {
+        "ok": True,
+        "action": "transferred",
+        "path": str(dest),
+        "bytes": written,
+        "sha256": digest,
+        "started_transfer": True,
+        "bytes_per_second": bytes_per_second,
+        "download_elapsed_s": download_elapsed_s,
+    }
 
 
 def _open(url: str, existing: int, expected_bytes: int) -> tuple[str, Any]:

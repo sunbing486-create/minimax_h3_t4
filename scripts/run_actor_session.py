@@ -235,14 +235,24 @@ def show_session_evidence(evidence: Path) -> dict[str, Any]:
         print(status_path.read_text(encoding="utf-8"), end="", flush=True)
     else:
         print("MISSING session-status.json", flush=True)
+    load_path = evidence / "load-result.json"
+    inline_path = evidence / "inline-evidence.json"
+    files.extend([load_path, inline_path, *sorted(evidence.rglob("rank*.log"))])
     if actor_path.is_file():
         print(actor_path.read_text(encoding="utf-8"), end="", flush=True)
+    elif load_path.is_file():
+        print("actor-result.json is not written by the UNet runner. load-result.json has the load error, ranks, and cleanup.", flush=True)
     else:
         print("MISSING actor-result.json", flush=True)
+    if inline_path.is_file():
+        print("BEGIN_INLINE_EVIDENCE source=runner-cell-output sealed_zip_is_original=true", flush=True)
+        print(inline_path.read_text(encoding="utf-8"), end="", flush=True)
+        print("END_INLINE_EVIDENCE", flush=True)
     for path in files:
         if path.is_file():
             listing.append({"name": path.name, "path": str(path), "bytes": path.stat().st_size, "missing": False})
             print(f"FILE {path.name} bytes={path.stat().st_size} path={path}", flush=True)
+            print("DOWNLOAD_BEFORE_STOP " + _link_path(path), flush=True)
         else:
             listing.append({"name": path.name, "path": str(path), "bytes": None, "missing": True})
             print(f"MISSING {path}", flush=True)
@@ -281,6 +291,8 @@ def seal_evidence(evidence: Path) -> dict[str, Any]:
         if not path.is_file():
             continue
         if path.resolve() in excluded or path.name in {zip_path.name, sidecar.name, paths["manifest"].name}:
+            continue
+        if path.suffix.lower() in {".safetensors", ".ckpt", ".pt", ".bin", ".zip"} or path.stat().st_size > 8 * 1024 * 1024:
             continue
         selected.append(path)
     partial = zip_path.with_name(zip_path.name + ".partial")

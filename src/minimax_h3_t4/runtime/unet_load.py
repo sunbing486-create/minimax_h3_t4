@@ -147,6 +147,7 @@ def sample_process_memory(label: str) -> dict[str, Any]:
     return {
         "label": label,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pid": os.getpid(),
         "rss_bytes": rss,
         "pss_bytes": pss,
         "mem_available_bytes": available,
@@ -199,6 +200,31 @@ def _import_status(name: str) -> dict[str, Any]:
     return {"name": name, "status": "imported"}
 
 
+def worker_probe_blockers(probe: dict[str, Any], *, require_cuda: int = 2) -> list[str]:
+    """Block the download when the Ray worker, not the driver, is unready."""
+
+    blockers: list[str] = []
+    if probe.get("error_type"):
+        blockers.append(f"ray worker probe failed: {probe.get('error_type')}")
+    for row in probe.get("imports") or []:
+        status = row.get("status")
+        name = row.get("name")
+        if status == "missing_module":
+            blockers.append(f"ray worker missing {name}")
+        elif require_cuda == 2 and status != "imported":
+            blockers.append(f"ray worker import {name} status {status}")
+    if probe.get("cuda_count") != require_cuda:
+        blockers.append(f"ray worker needs {require_cuda} CUDA devices, found {probe.get('cuda_count')}")
+    if probe.get("checkpoint_dir_writable") is not True:
+        blockers.append("ray worker cannot write the checkpoint directory")
+    expected = probe.get("expected_versions") or {}
+    versions = probe.get("versions") or {}
+    for name, wanted in expected.items():
+        if wanted and versions.get(name) != wanted:
+            blockers.append(f"ray worker {name} {versions.get(name)} != driver {wanted}")
+    return blockers
+
+
 def run_unet_load_only(
     *,
     unet_path: str | None,
@@ -207,6 +233,7 @@ def run_unet_load_only(
     available_bytes: int,
     evidence: Any | None = None,
     deadline: float | None = None,
+    comfy_root: str | None = None,
 ) -> dict[str, Any]:
     reusable = False
     if unet_path:
@@ -226,11 +253,13 @@ def run_unet_load_only(
             return decision
     if evidence is not None:
         evidence.event("unet_load_only_start", path=unet_path, timeout_seconds=load_timeout)
-    from ..loader_nodes import H3T4Initializer, H3T4UNETLoader
+    from ..loader_nodes import H3T4Initializer, H3T4UNETLoader, build_unet_runtime_env
 
     group = None
     try:
-        group = H3T4Initializer().initialize(load_after=object(), manage_parent_memory=False, for_admission=True, force_on_failure=True)[0]
+        builder = (lambda: build_unet_runtime_env(Path(comfy_root))) if comfy_root else None
+        initializer = H3T4Initializer(runtime_env_builder=builder) if builder is not None else H3T4Initializer()
+        group = initializer.initialize(load_after=object(), manage_parent_memory=False, for_admission=False, force_on_failure=True)[0]
         group = H3T4UNETLoader(path_resolver=lambda _name: str(unet_path)).load(
             group,
             str(unet_path),
@@ -259,13 +288,41 @@ def run_unet_load_only(
             evidence.event("unet_load_only_done", unet_loaded=decision["unet_loaded"])
         return decision
     except Exception as exc:
-        decision.update({"action": "FAILED", "unet_loaded": False, "error_type": type(exc).__name__, "message": str(exc)[:500]})
+        decision["worker_diagnostics"] = _worker_diagnostics(group)
+        decision.update({"action": "FAILED", "unet_loaded": False, "error_type": type(exc).__name__, "message": str(exc)[:2000], "weight_alignment": "unknown"})
         if evidence is not None:
             evidence.event("unet_load_only_failed", error_type=type(exc).__name__)
         return decision
     finally:
+        cleanup: dict[str, Any] = {"attempted": group is not None and getattr(group, "alive", False)}
         if group is not None and getattr(group, "alive", False):
-            group.close(timeout_seconds=float(os.environ.get("H3_T4_CLEANUP_TIMEOUT_S", "20")), force=True)
+            try:
+                group.close(timeout_seconds=float(os.environ.get("H3_T4_CLEANUP_TIMEOUT_S", "20")), force=True)
+                cleanup["ok"] = True
+                cleanup["termination"] = getattr(group, "termination", None)
+            except Exception as exc:
+                cleanup["ok"] = False
+                cleanup["error_type"] = type(exc).__name__
+                cleanup["message"] = str(exc)[:500]
+                cleanup["termination"] = getattr(group, "termination", None)
+        else:
+            cleanup["ok"] = True
+        decision["cleanup"] = cleanup
+
+
+def _worker_diagnostics(group: Any) -> list[dict[str, Any]]:
+    if group is None:
+        return []
+    from .lifecycle import remote
+    from .startup import resolve_one
+
+    rows = []
+    for index, worker in enumerate(getattr(group, "workers", []) or []):
+        try:
+            rows.append(resolve_one(group.ray_module, remote(worker, "load_diagnostics"), 15, label=f"load_diagnostics rank {index}"))
+        except Exception as exc:
+            rows.append({"rank": index, "error_type": type(exc).__name__, "message": str(exc)[:300]})
+    return rows
 
 
 def _loaded(reports: list[dict[str, Any]]) -> bool:

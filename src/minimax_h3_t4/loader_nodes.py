@@ -113,19 +113,20 @@ def build_admission_runtime_env() -> dict[str, object]:
     }
 
 
-def _build_runtime_env() -> dict[str, object]:
-    import folder_paths
+def build_unet_runtime_env(comfy_root: Path) -> dict[str, object]:
+    """Runtime env used by H3T4Worker.load_unet.
 
+    The Comfy checkout is not installed as a site package. A driver
+    ``sys.path`` insert does not reach a Ray worker. The worker only sees
+    this ``PYTHONPATH``.
+    """
+
+    root = Path(comfy_root).resolve()
+    if not (root / "comfy" / "model_detection.py").is_file() or not (root / "folder_paths.py").is_file():
+        raise RuntimeError(f"ComfyUI checkout is incomplete: {root}")
     package_dir = Path(__file__).resolve().parent
-    comfy_file = Path(folder_paths.__file__).resolve()
-    comfy_root = next(
-        (parent for parent in comfy_file.parents if (parent / "main.py").exists() and (parent / "execution.py").exists()),
-        None,
-    )
-    if comfy_root is None:
-        raise RuntimeError("Unable to locate the ComfyUI repository root for Ray workers")
     runtime_workdir = ray_runtime_paths()["working_dir"]
-    python_entries = [str(comfy_root)]
+    python_entries = [str(root)]
     existing = os.environ.get("PYTHONPATH")
     if existing:
         python_entries.extend(part for part in existing.split(os.pathsep) if part)
@@ -134,10 +135,89 @@ def _build_runtime_env() -> dict[str, object]:
         "working_dir": str(runtime_workdir),
         "env_vars": build_runtime_env_vars(
             pythonpath=os.pathsep.join(dict.fromkeys(python_entries)),
-            comfy_root=str(comfy_root),
+            comfy_root=str(root),
             evidence_dir=os.environ.get("H3_T4_EVIDENCE_DIR"),
         ),
     }
+
+
+def _build_runtime_env() -> dict[str, object]:
+    import folder_paths
+
+    comfy_file = Path(folder_paths.__file__).resolve()
+    comfy_root = next(
+        (parent for parent in comfy_file.parents if (parent / "main.py").exists() and (parent / "execution.py").exists()),
+        None,
+    )
+    if comfy_root is None:
+        raise RuntimeError("Unable to locate the ComfyUI repository root for Ray workers")
+    return build_unet_runtime_env(comfy_root)
+
+
+LOAD_WORKER_IMPORTS = (
+    "comfy",
+    "folder_paths",
+    "comfy.model_detection",
+    "comfy.model_management",
+    "comfy.utils",
+    "xfuser.core.distributed",
+    "yunchang",
+    "torch",
+    "ray",
+)
+
+
+def probe_worker_imports(
+    *,
+    runtime_env: dict[str, object],
+    checkpoint_dir: Path,
+    checkpoint_file: str | None = None,
+    module_names: tuple[str, ...] = LOAD_WORKER_IMPORTS,
+) -> dict[str, Any]:
+    """Import the load stack inside a Ray worker, not in the driver.
+
+    The worker process gets ``runtime_env`` and Ray's working directory as its
+    cwd. The driver's ``sys.path`` is not copied.
+    """
+
+    import ray
+
+    from .runtime.worker import worker_import_snapshot
+
+    ray.shutdown()
+    paths = ray_runtime_paths()
+    try:
+        ray.init(
+            address="local",
+            namespace="h3-unet-import-probe",
+            include_dashboard=False,
+            num_cpus=1,
+            object_store_memory=80 * 1024 * 1024,
+            _temp_dir=str(paths["temp_dir"]),
+            runtime_env=runtime_env,
+        )
+        remote = ray.remote(worker_import_snapshot)
+        snapshot = ray.get(
+            remote.remote(list(module_names), str(checkpoint_dir), checkpoint_file),
+            timeout=90,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:500],
+            "imports": [],
+            "cuda_count": None,
+            "checkpoint_dir_writable": False,
+            "download": False,
+        }
+    finally:
+        ray.shutdown()
+    if not isinstance(snapshot, dict):
+        return {"ok": False, "error_type": "bad_probe", "message": "worker probe returned no report", "imports": [], "download": False}
+    snapshot["download"] = False
+    snapshot["runtime_pythonpath"] = (runtime_env.get("env_vars") or {}).get("PYTHONPATH")
+    return snapshot
 
 
 def _resolve_unet(name: str) -> str:
